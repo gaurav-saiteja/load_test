@@ -6,9 +6,9 @@ import sys
 
 # --- CONFIGURATION ---
 FILE_PATH = "image_ids.txt" # Change this to your text file name
-CONCURRENCY = 10            # Number of simultaneous threads
-RUNTIME_SECONDS = 3 * 3600  # 3 hours in seconds
-URL_TEMPLATE = "https://my.media-example.site/images/M/{id}@._V1_SX90000_SY90000_AL_US900000_QL100_FMpng_.png"
+CONCURRENCY = 150            # Number of simultaneous threads
+RUNTIME_SECONDS = 6 * 3600  # 3 hours in seconds
+URL_TEMPLATE = "https://m.media-amazon.com/images/M/{id}@._V1_SX90000_SY90000_AL_US900000_QL100_FMpng_.png"
 
 def load_ids(filepath):
     """Loads image IDs from the text file into memory."""
