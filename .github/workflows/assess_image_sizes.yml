@@ -1,0 +1,29 @@
+name: Assess Top 50 Largest Images
+
+# This trigger allows you to manually run the workflow from the GitHub Actions tab.
+on:
+  workflow_dispatch: 
+
+jobs:
+  analyze_sizes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        # Pulls your code (including image_ids.txt and the python script) into the runner
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip' # Speeds up subsequent runs
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Image Size Assessment
+        # Executes the script at the root of the repo
+        run: python find_largest_images.py
