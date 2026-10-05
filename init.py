@@ -48,6 +48,7 @@ def load_test_worker(worker_id, image_ids, end_time, results_dict):
             total_bytes += len(response.content)
 
             if response.status_code == 200:
+                print(f"[Worker {worker_id}] 200", flush=True)
                 success_count += 1
             else:
                 failed_count += 1
@@ -61,11 +62,10 @@ def load_test_worker(worker_id, image_ids, end_time, results_dict):
             print(f"[Worker {worker_id}] Error: {type(e).__name__} for image '{image_id}'", flush=True)
 
         # Push live stats to the shared dictionary every 50 requests
-        if req_count % 50 == 0:
-            results_dict[worker_id] = {
-                "requests": req_count, "success": success_count,
-                "failed": failed_count, "bytes": total_bytes
-            }
+        results_dict[worker_id] = {
+            "requests": req_count, "success": success_count,
+            "failed": failed_count, "bytes": total_bytes
+        }
 
     # Final update when loop naturally finishes
     results_dict[worker_id] = {
