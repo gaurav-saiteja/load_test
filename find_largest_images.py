@@ -7,7 +7,7 @@ import concurrent.futures
 FILE_PATH = "image_ids.txt" # Must be at the root of the repo
 TOP_N = 50
 THREADS = 20 # Safe concurrency for fetching headers quickly
-URL_TEMPLATE = "https://my.media-example.site/images/M/{id}@._V1_SX90000_SY90000_AL_US900000_QL100_FMpng_.png"
+URL_TEMPLATE = "https://m.media-amazon.com/images/M/{id}@._V1_SX90000_SY90000_AL_US900000_QL100_FMpng_.png"
 
 def get_image_size(image_id):
     """Fetches the file size of an image using an HTTP HEAD request."""
