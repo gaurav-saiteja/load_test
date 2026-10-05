@@ -39,16 +39,12 @@ def load_test_worker(worker_id, image_ids, end_time, results_dict):
 
     # Run as fast as computationally possible until 3 hours pass
     while time.time() < end_time:
-        # Pick a random ID from the list
         image_id = random.choice(image_ids)
         url = URL_TEMPLATE.format(id=image_id)
         
         try:
-            # Fetch the image. This pulls the body into memory to simulate actual egress.
             response = session.get(url, timeout=15)
             req_count += 1
-            
-            # Count the bytes transferred (Body + roughly headers) to help calculate cost
             total_bytes += len(response.content)
 
             if response.status_code == 200:
@@ -57,16 +53,20 @@ def load_test_worker(worker_id, image_ids, end_time, results_dict):
                 failed_count += 1
                 
         except requests.exceptions.RequestException:
-            # Handles timeouts, connection drops, etc.
             req_count += 1
             failed_count += 1
 
-    # Save the thread's local results back to the shared dictionary
+        # Push live stats to the shared dictionary every 50 requests
+        if req_count % 50 == 0:
+            results_dict[worker_id] = {
+                "requests": req_count, "success": success_count,
+                "failed": failed_count, "bytes": total_bytes
+            }
+
+    # Final update when loop naturally finishes
     results_dict[worker_id] = {
-        "requests": req_count,
-        "success": success_count,
-        "failed": failed_count,
-        "bytes": total_bytes
+        "requests": req_count, "success": success_count,
+        "failed": failed_count, "bytes": total_bytes
     }
 
 def main():
@@ -82,7 +82,7 @@ def main():
     # Setup timing and threading structures
     end_time = time.time() + RUNTIME_SECONDS
     threads = []
-    results_dict = {}
+    results_dict = {i: {"requests": 0, "success": 0, "failed": 0, "bytes": 0} for i in range(CONCURRENCY)}
 
     print(f"\nStarting {CONCURRENCY} concurrent threads...")
     print(f"Test will run for exactly {RUNTIME_SECONDS / 3600} hours. Please wait...\n")
@@ -94,11 +94,23 @@ def main():
         t = threading.Thread(target=load_test_worker, args=(i, image_ids, end_time, results_dict))
         threads.append(t)
         t.start()
+    print("\nBeginning load test (printing live progress every 60 seconds)...", flush=True)
+    # Monitor progress while threads are running
+    while any(t.is_alive() for t in threads):
+        # Sleep in 1-second chunks to break out cleanly if threads finish early
+        for _ in range(60):
+            if not any(t.is_alive() for t in threads):
+                break
+            time.sleep(1)
+            
+        if any(t.is_alive() for t in threads):
+            elapsed = time.time() - start_time
+            current_reqs = sum(res["requests"] for res in results_dict.values())
+            print(f"Progress: {elapsed/60:.1f} / {RUNTIME_SECONDS/60:.1f} mins elapsed | Live Requests: {current_reqs:,}...", flush=True)
 
-    # Wait for all threads to finish their 3-hour loop
+    # Clean up at the very end
     for t in threads:
         t.join()
-
     actual_duration = time.time() - start_time
 
     # Aggregate results from all 10 threads
