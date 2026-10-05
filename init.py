@@ -51,10 +51,14 @@ def load_test_worker(worker_id, image_ids, end_time, results_dict):
                 success_count += 1
             else:
                 failed_count += 1
+                # Log the non-200 status code immediately
+                print(f"[Worker {worker_id}] Warning: Received status {response.status_code} for image '{image_id}'", flush=True)
                 
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
             req_count += 1
             failed_count += 1
+            # Log timeouts or connection drops
+            print(f"[Worker {worker_id}] Error: {type(e).__name__} for image '{image_id}'", flush=True)
 
         # Push live stats to the shared dictionary every 50 requests
         if req_count % 50 == 0:
