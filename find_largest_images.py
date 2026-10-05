@@ -13,17 +13,16 @@ def get_image_size(image_id):
     """Fetches the file size of an image using an HTTP HEAD request."""
     url = URL_TEMPLATE.format(id=image_id)
     try:
-        # A HEAD request fetches headers only, saving massive amounts of bandwidth/time
-        response = requests.head(url, timeout=10, allow_redirects=True)
+        # Use 'with' to ensure connections close immediately
+        with requests.head(url, timeout=10, allow_redirects=True) as response:
+            if response.status_code == 200 and 'Content-Length' in response.headers:
+                return (image_id, int(response.headers.get('Content-Length', 0)))
         
-        # Fallback: If server rejects HEAD or hides Content-Length, do a streaming GET
-        if response.status_code != 200 or 'Content-Length' not in response.headers:
-            response = requests.get(url, stream=True, timeout=10)
+        # Fallback if server rejects HEAD
+        with requests.get(url, stream=True, timeout=10) as response:
+            return (image_id, int(response.headers.get('Content-Length', 0)))
             
-        size_bytes = int(response.headers.get('Content-Length', 0))
-        return (image_id, size_bytes)
     except Exception as e:
-        # Return 0 if the request fails (timeout, 404, etc.)
         return (image_id, 0)
 
 def main():
@@ -44,13 +43,20 @@ def main():
     results = []
     
     # 2. Fetch sizes concurrently
+    total_images = len(image_ids)
+    processed_count = 0
+    
+    # Fetch sizes concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
-        # Submit all tasks to the executor
         future_to_id = {executor.submit(get_image_size, img_id): img_id for img_id in image_ids}
         
-        # As each task completes, append it to our results list
         for future in concurrent.futures.as_completed(future_to_id):
             results.append(future.result())
+            processed_count += 1
+            
+            # Print progress every 50 images
+            if processed_count % 50 == 0 or processed_count == total_images:
+                print(f"Progress: [{processed_count}/{total_images}] images checked...", flush=True)
 
     # 3. Sort results by size (descending) and grab the top 50
     results.sort(key=lambda x: x[1], reverse=True)
