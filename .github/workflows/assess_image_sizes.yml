@@ -26,4 +26,4 @@ jobs:
 
       - name: Run Image Size Assessment
         # Executes the script at the root of the repo
-        run: python -u find_largest_images.py
+        run: python -u init.py
