@@ -48,8 +48,8 @@ jobs:
           # Check if the cache successfully restored the Python packages
           if [ -d "/tmp/stage_root/opt/fastdeps/pydeps" ]; then
             echo "⚡ Cache HIT! Copying pre-built dependencies to root..."
-            # Copy everything directly into the root filesystem
-            sudo cp -a /tmp/stage_root/. /
+            # Use tar to safely copy files into system symlinks like /bin and /lib
+            sudo tar -cf - -C /tmp/stage_root . | sudo tar --keep-directory-symlink -xf - -C /
           else
             echo "🛠️ Cache MISS. Downloading and building dependencies..."
             curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -72,7 +72,7 @@ jobs:
             find /tmp/stage_root/opt/fastdeps/pydeps -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
             
             echo "Copying built dependencies to root..."
-            sudo cp -a /tmp/stage_root/. /
+            sudo tar -cf - -C /tmp/stage_root . | sudo tar --keep-directory-symlink -xf - -C /
           fi
 
           # Link shared libraries, start Cloudflare WARP daemon, and expose Python path
