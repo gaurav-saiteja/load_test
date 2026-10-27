@@ -1,0 +1,458 @@
+name: NUPPPP 3
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_link:
+        description: 'Direct link to payload (Drive, Torrent, Magnet)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process-queue:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache System and Python Dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          # We cache the staging directory so we don't have to compress it manually
+          path: /tmp/stage_root
+          # Bump 'v1' to 'v2' if you ever change the packages in the future to bust the cache
+          key: ${{ runner.os }}-deps-v1
+
+      - name: Install Dependencies
+        run: |
+          T_START=$(date +%s%3N)
+          
+          # Check if the cache successfully restored the Python packages
+          if [ -d "/tmp/stage_root/opt/fastdeps/pydeps" ]; then
+            echo "⚡ Cache HIT! Copying pre-built dependencies to root..."
+            # Use tar to safely copy files into system symlinks like /bin and /lib
+            sudo tar -cf - -C /tmp/stage_root . | sudo tar --keep-directory-symlink -xf - -C /
+          else
+            echo "🛠️ Cache MISS. Downloading and building dependencies..."
+            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+            sudo apt-get update
+            mkdir -p /tmp/debs /tmp/stage_root/opt/fastdeps/pydeps
+            
+            # Download .deb packages
+            sudo apt-get install -y --download-only -o Dir::Cache::archives="/tmp/debs" unrar cloudflare-warp
+            for deb in /tmp/debs/*.deb; do
+              dpkg-deb -x "$deb" /tmp/stage_root
+            done
+            
+            # 🧹 Strip docs and man pages to reduce cache size
+            rm -rf /tmp/stage_root/usr/share/doc /tmp/stage_root/usr/share/man
+            
+            # Pre-install all Python packages
+            pip install -U --break-system-packages --target=/tmp/stage_root/opt/fastdeps/pydeps \
+              pyrofork tgcrypto requests google-auth tqdm uvloop
+            find /tmp/stage_root/opt/fastdeps/pydeps -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+            
+            echo "Copying built dependencies to root..."
+            sudo tar -cf - -C /tmp/stage_root . | sudo tar --keep-directory-symlink -xf - -C /
+          fi
+
+          # Link shared libraries, start Cloudflare WARP daemon, and expose Python path
+          sudo ldconfig
+          sudo systemctl daemon-reload
+          sudo systemctl start warp-svc || (sudo nohup warp-svc >/dev/null 2>&1 &)
+          echo "PYTHONPATH=/opt/fastdeps/pydeps" >> $GITHUB_ENV
+          
+          T_END=$(date +%s%3N)
+          echo "✅ Dependencies ready in $((T_END - T_START)) ms."
+
+      - name: Acknowledge Payload
+        id: payload_ack
+        run: |
+          echo "Target acquired: ${{ inputs.target_link }}"
+          echo "TARGET_LINK=${{ inputs.target_link }}" >> $GITHUB_ENV
+          echo "found=true" >> $GITHUB_ENV
+
+      - name: Download and Extract Payload
+        if: env.found == 'true'
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          mkdir -p workspace
+          echo "Evaluating Payload Type..."
+
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+
+          for i in {1..12}; do
+            if curl -s -x socks5://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then break; fi
+            sleep 5
+          done
+
+          IS_TORRENT=false
+          if [[ "$TARGET_LINK" == magnet:* ]] || [[ "$TARGET_LINK" == *.torrent* ]]; then IS_TORRENT=true; fi
+
+          if [[ "$TARGET_LINK" == *drive.google.com* ]] || [[ "$TARGET_LINK" == *drive.usercontent.google.com* ]]; then
+            if [[ "$TARGET_LINK" == *\&at=* ]] || [[ "$TARGET_LINK" == *confirm=t* ]]; then
+              cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..
+            else
+              cat << 'EOF' > gdrive_sa_dl.py
+          import os, sys, re, json, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+          from tqdm import tqdm
+          link, sa_json_str = sys.argv[1], os.environ.get('GCP_SA_JSON')
+          if not sa_json_str: sys.exit(1)
+          sa_info = json.loads(sa_json_str)
+          creds = service_account.Credentials.from_service_account_info(sa_info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+          creds.refresh(Request())
+          headers = {'Authorization': f'Bearer {creds.token}'}
+          match = re.search(r'(id=|/d/|folders/)([a-zA-Z0-9_-]+)', link)
+          file_id = match.group(2)
+          def download_file(fid, fname):
+              url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+              with requests.get(url, headers=headers, stream=True) as r:
+                  total_size = int(r.headers.get('Content-Length', 0))
+                  with open(os.path.join("workspace", fname), 'wb') as f:
+                      with tqdm(total=total_size, unit='iB', unit_scale=True, desc=fname[:30], ascii=True) as pbar:
+                          for chunk in r.iter_content(chunk_size=1024*1024*10):
+                              if chunk: f.write(chunk); pbar.update(len(chunk))
+          def process_node(fid):
+              res = requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?fields=name,mimeType", headers=headers).json()
+              if res.get('mimeType') == 'application/vnd.google-apps.folder':
+                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false", headers=headers).json().get('files', [])
+                  for child in children: process_node(child['id'])
+              else: download_file(fid, res['name'])
+          process_node(file_id)
+          EOF
+              python3 gdrive_sa_dl.py "$TARGET_LINK"
+            fi
+
+          elif [[ "$IS_TORRENT" == "false" ]] && [[ "$TARGET_LINK" == http* ]]; then
+            HEADERS=$(curl -g -sIL -x socks5h://127.0.0.1:40000 -H 'User-Agent: Mozilla/5.0' "$TARGET_LINK" || true)
+            SERVER_FILENAME=$(python3 -c "import sys, re, urllib.parse; h=sys.stdin.read(); m=re.search(r'(?i)filename\*?=(?:\"?UTF-8\'\'\"?)?([^\r\n;]+)', h); print(urllib.parse.unquote(m.group(1).strip(' \"\'')) if m else 'Direct_Payload.mkv')" <<< "$HEADERS")
+            wget -qO yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && chmod +x yt-dlp
+            ./yt-dlp --proxy "socks5://127.0.0.1:40000" --add-header 'User-Agent: Mozilla/5.0' -N 16 -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+
+          else
+            wget -qO qbittorrent-nox https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox
+            chmod +x qbittorrent-nox
+            mkdir -p ~/.config/qBittorrent
+            cat << EOF_CONF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\Port=8085
+          WebUI\AuthSubnetWhitelistEnabled=true
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32, ::1/128
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=$(pwd)/workspace/
+          BitTorrent\Session\MaxConnections=500
+          BitTorrent\Session\Encryption=1
+          BitTorrent\Session\DHT=true
+          BitTorrent\Session\PeX=true
+          BitTorrent\Session\LSD=false
+          Network\Port=443
+          Proxy\Type=2
+          Proxy\IP=127.0.0.1
+          Proxy\Port=40000
+          Proxy\Enabled=true
+          Proxy\PeerExchange=true
+          Proxy\OnlyForTorrents=false
+          EOF_CONF
+            ./qbittorrent-nox -d --confirm-legal-notice
+            cat << 'EOF_PY' > qbit_monitor.py
+          import time, requests, sys
+          target_link, base_url = sys.argv[1], "http://127.0.0.1:8085/api/v2"
+          for _ in range(30):
+              try: requests.get(f"{base_url}/app/version"); break
+              except: time.sleep(1)
+          requests.post(f"{base_url}/torrents/add", data={'urls': target_link})
+          start_t, last_p = time.time(), -1
+          while True:
+              try:
+                  torrents = requests.get(f"{base_url}/torrents/info").json()
+                  if not torrents: 
+                      if time.time() - start_t > 60: sys.exit(1)
+                      time.sleep(2); continue
+                  t = torrents[0]
+                  if t.get('progress', 0) > last_p: start_t, last_p = time.time(), t.get('progress')
+                  if t.get('progress') == 1.0 or t.get('state') in ['uploading', 'stalledUP']: break
+                  if time.time() - start_t > 600: sys.exit(1)
+                  time.sleep(5)
+              except: time.sleep(2)
+          EOF_PY
+            python3 qbit_monitor.py "$TARGET_LINK"
+            curl -s -X POST http://127.0.0.1:8085/api/v2/app/shutdown || true
+            rm qbittorrent-nox
+          fi
+          warp-cli --accept-tos disconnect
+
+          # Extract RARs and ZIPs
+          find workspace -type f -name "*.zip" -exec unzip -q -o {} -d workspace/ \; -exec rm {} \;
+          while read -u 9 RAR; do
+            unrar e -y "$RAR" workspace/ || true
+            DIR=$(dirname "$RAR")
+            rm -f "$DIR"/*.rar "$DIR"/*.r[0-9][0-9] "$DIR"/*.sfv "$DIR"/*.nfo
+          done 9< <(find workspace -type f -name "*.rar")
+
+      - name: Sequential Stream, Chunk, and Upload to 
+        if: env.found == 'true'
+        env:
+          BG_API_ID: ${{ secrets.BG_API_ID }}
+          BG_API_HASH: ${{ secrets.BG_API_HASH }}
+          BG_BOT_TOKEN: ${{ secrets.BG_BOT_TOKEN }}
+          BG_CHAT_ID: ${{ secrets.BG_CHAT_ID }}
+        run: |
+          # 1. Kernel TCP/BBR network stack tuning for multi-gigabit egress
+          sudo sysctl -w net.core.rmem_max=134217728 >/dev/null 2>&1 || true
+          sudo sysctl -w net.core.wmem_max=134217728 >/dev/null 2>&1 || true
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 87380 134217728" >/dev/null 2>&1 || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+
+          # Ensure uvloop is present for C-level libuv socket scheduling
+          python3 -c "import uvloop" 2>/dev/null || pip install -q --break-system-packages uvloop
+
+          cat << 'EOF_PY' > upload_processor.py
+          import os
+          import sys
+          import math
+          import time
+          import random
+          import asyncio
+          import uvloop
+          from pyrogram import Client, raw
+          from pyrogram.session import Session
+          from pyrogram.errors import FloodWait
+
+          uvloop.install()
+
+          API_ID = int(os.environ['BG_API_ID'])
+          API_HASH = os.environ['BG_API_HASH']
+          CHAT_ID = int(os.environ['BG_CHAT_ID'])
+
+          # Parse comma-separated bot tokens dynamically
+          BOT_TOKENS = [t.strip() for t in os.environ.get('BG_BOT_TOKEN', '').split(',') if t.strip()]
+          if not BOT_TOKENS:
+              print("❌ No bot tokens found in BG_BOT_TOKEN.")
+              sys.exit(1)
+
+          print(f"🤖 Detected {len(BOT_TOKENS)} bot token(s) in current execution run.")
+
+          # Locate target payload
+          workspace_dir = 'workspace'
+          all_files = [
+              os.path.join(root, f)
+              for root, _, files in os.walk(workspace_dir)
+              for f in files
+          ]
+          if not all_files:
+              print("❌ No files found in workspace.")
+              sys.exit(1)
+
+          target_file = max(all_files, key=os.path.getsize)
+          file_size = os.path.getsize(target_file)
+          base_filename = os.path.basename(target_file)
+
+          # MTProto maximum geometry: 3990 parts * 512 KiB = 1995.0 MiB per chunk
+          PART_SIZE = 512 * 1024
+          PARTS_PER_CHUNK = 3990
+          CHUNK_SIZE = PARTS_PER_CHUNK * PART_SIZE
+          total_chunks = math.ceil(file_size / CHUNK_SIZE)
+
+          # Dynamic socket/worker scaling based on active bots vs chunks
+          active_bot_count = min(len(BOT_TOKENS), total_chunks)
+          SESSIONS_PER_BOT = 6 if active_bot_count >= 3 else 10
+          WORKERS_PER_BOT = 48 if active_bot_count >= 3 else 80
+
+          print(f"🎬 Target: {base_filename} | Size: {file_size / (1024**3):.2f} GiB | Chunks: {total_chunks} (1995 MiB max)")
+          print(f"⚡ Swarm Config: {active_bot_count} Active Bot(s) × {SESSIONS_PER_BOT} Media TCP Sockets/Bot = {active_bot_count * SESSIONS_PER_BOT} Parallel Streams")
+
+          # Open single read-only file descriptor for lockless os.pread()
+          fd = os.open(target_file, os.O_RDONLY)
+          if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
+              os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
+
+
+          class BotSwarmNode:
+              def __init__(self, idx: int, token: str):
+                  self.idx = idx
+                  self.token = token
+                  self.client = Client(
+                      name=f"swarm_bot_{idx}",
+                      api_id=API_ID,
+                      api_hash=API_HASH,
+                      bot_token=token,
+                      in_memory=True,
+                      no_updates=True,
+                      sleep_threshold=60
+                  )
+                  self.media_sessions = []
+                  self.peer = None
+
+              async def start(self):
+                  await self.client.start()
+                  self.peer = await self.client.resolve_peer(CHAT_ID)
+                  dc_id = await self.client.storage.dc_id()
+                  auth_key = await self.client.storage.auth_key()
+                  test_mode = await self.client.storage.test_mode()
+
+                  # Spin up dedicated MTProto media TCP sockets sharing the same auth_key
+                  for _ in range(SESSIONS_PER_BOT):
+                      s = Session(
+                          self.client,
+                          dc_id,
+                          auth_key,
+                          test_mode,
+                          is_media=True
+                      )
+                      self.media_sessions.append(s)
+
+                  await asyncio.gather(*(s.start() for s in self.media_sessions))
+
+              async def stop(self):
+                  await asyncio.gather(*(s.stop() for s in self.media_sessions), return_exceptions=True)
+                  await self.client.stop()
+
+
+          async def push_part(sessions, start_slot, file_id, part_idx, total_parts, offset, size):
+              payload = os.pread(fd, size, offset)
+              attempt = 0
+              while True:
+                  session = sessions[(start_slot + attempt) % len(sessions)]
+                  try:
+                      await session.invoke(
+                          raw.functions.upload.SaveBigFilePart(
+                              file_id=file_id,
+                              file_part=part_idx,
+                              file_total_parts=total_parts,
+                              bytes=payload
+                          )
+                      )
+                      return
+                  except FloodWait as e:
+                      await asyncio.sleep(e.value + 1)
+                  except Exception:
+                      attempt += 1
+                      await asyncio.sleep(min(0.5 * attempt, 3.0))
+
+
+          async def upload_chunk_on_node(node: BotSwarmNode, chunk_idx: int):
+              t0 = time.perf_counter()
+              chunk_filename = f"{base_filename}.{chunk_idx:03d}"
+              chunk_offset = (chunk_idx - 1) * CHUNK_SIZE
+              this_chunk_size = min(CHUNK_SIZE, file_size - chunk_offset)
+              total_parts = math.ceil(this_chunk_size / PART_SIZE)
+              file_id = random.getrandbits(63)
+
+              print(f"🚀 [Bot #{node.idx + 1}] Pre-uploading Part {chunk_idx}/{total_chunks} ({this_chunk_size / (1024**2):.1f} MiB, {total_parts} parts)...")
+
+              part_cursor = 0
+
+              async def worker(worker_id: int):
+                  nonlocal part_cursor
+                  while True:
+                      p_idx = part_cursor
+                      if p_idx >= total_parts:
+                          return
+                      part_cursor += 1
+                      p_offset = chunk_offset + (p_idx * PART_SIZE)
+                      p_size = min(PART_SIZE, (chunk_offset + this_chunk_size) - p_offset)
+                      await push_part(
+                          node.media_sessions,
+                          worker_id,
+                          file_id,
+                          p_idx,
+                          total_parts,
+                          p_offset,
+                          p_size
+                      )
+
+              await asyncio.gather(*(worker(w) for w in range(WORKERS_PER_BOT)))
+
+              elapsed = max(0.001, time.perf_counter() - t0)
+              mbps = (this_chunk_size / (1024 * 1024)) / elapsed
+              print(f"⚡ [Bot #{node.idx + 1}] Finished Part {chunk_idx}/{total_chunks} in {elapsed:.1f}s ({mbps:.1f} MiB/s)")
+
+              input_file = raw.types.InputFileBig(
+                  id=file_id,
+                  parts=total_parts,
+                  name=chunk_filename
+              )
+              return node, chunk_filename, input_file
+
+
+          async def main():
+              global_start = time.perf_counter()
+
+              # Initialize only as many bots as needed up to total_chunks
+              nodes = [BotSwarmNode(i, BOT_TOKENS[i]) for i in range(active_bot_count)]
+              await asyncio.gather(*(n.start() for n in nodes))
+
+              loop = asyncio.get_running_loop()
+              chunk_futures = [loop.create_future() for _ in range(total_chunks)]
+              chunk_queue = asyncio.Queue()
+              for c_idx in range(1, total_chunks + 1):
+                  chunk_queue.put_nowait(c_idx)
+
+              # Each bot continuously pulls the next unallocated chunk as soon as it finishes one
+              async def bot_worker_loop(node: BotSwarmNode):
+                  while not chunk_queue.empty():
+                      try:
+                          c_idx = chunk_queue.get_nowait()
+                      except asyncio.QueueEmpty:
+                          return
+                      try:
+                          res = await upload_chunk_on_node(node, c_idx)
+                          chunk_futures[c_idx - 1].set_result(res)
+                      except Exception as exc:
+                          chunk_futures[c_idx - 1].set_exception(exc)
+                          raise
+
+              # Commit messages to the chat in strict sequential order (.001 -> .002 -> .003)
+              async def sequential_committer():
+                  for c_idx in range(1, total_chunks + 1):
+                      node, chunk_filename, input_file = await chunk_futures[c_idx - 1]
+                      while True:
+                          try:
+                              await node.client.invoke(
+                                  raw.functions.messages.SendMedia(
+                                      peer=node.peer,
+                                      media=raw.types.InputMediaUploadedDocument(
+                                          file=input_file,
+                                          mime_type="application/octet-stream",
+                                          attributes=[raw.types.DocumentAttributeFilename(file_name=chunk_filename)],
+                                          force_file=True
+                                      ),
+                                      message=chunk_filename,
+                                      random_id=node.client.rnd_id()
+                                  )
+                              )
+                              print(f"✅ [Committed {c_idx}/{total_chunks}] {chunk_filename} (via Bot #{node.idx + 1})")
+                              break
+                          except FloodWait as e:
+                              await asyncio.sleep(e.value + 1)
+
+              await asyncio.gather(
+                  sequential_committer(),
+                  *(bot_worker_loop(n) for n in nodes)
+              )
+
+              os.close(fd)
+              await asyncio.gather(*(n.stop() for n in nodes))
+
+              total_elapsed = max(0.001, time.perf_counter() - global_start)
+              agg_speed = (file_size / (1024 * 1024)) / total_elapsed
+              print(f"\n🎉 All {total_chunks} chunks uploaded & committed in {total_elapsed:.1f}s (Effective: {agg_speed:.1f} MiB/s)!")
+
+          asyncio.run(main())
+          EOF_PY
+
+          python3 upload_processor.py
+          rm -rf workspace/
