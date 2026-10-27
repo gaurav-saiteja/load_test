@@ -1,4 +1,4 @@
-name: NUPPPP 3
+name: NUPPPP 4
 
 on:
   workflow_dispatch:
@@ -266,13 +266,16 @@ jobs:
           CHUNK_SIZE = PARTS_PER_CHUNK * PART_SIZE
           total_chunks = math.ceil(file_size / CHUNK_SIZE)
 
-          # Dynamic socket/worker scaling based on active bots vs chunks
+          # Anti-throttling & anti-head-of-line-blocking concurrency geometry:
+          # 8 TCP Media Sessions per bot, strictly capped at 3 in-flight 512 KiB parts per socket (24 workers/bot)
           active_bot_count = min(len(BOT_TOKENS), total_chunks)
-          SESSIONS_PER_BOT = 6 if active_bot_count >= 3 else 10
-          WORKERS_PER_BOT = 48 if active_bot_count >= 3 else 80
+          SESSIONS_PER_BOT = 8
+          MAX_INFLIGHT_PER_SOCKET = 3
+          WORKERS_PER_BOT = SESSIONS_PER_BOT * MAX_INFLIGHT_PER_SOCKET
+          RPC_HARD_TIMEOUT = 12.0
 
           print(f"🎬 Target: {base_filename} | Size: {file_size / (1024**3):.2f} GiB | Chunks: {total_chunks} (1995 MiB max)")
-          print(f"⚡ Swarm Config: {active_bot_count} Active Bot(s) × {SESSIONS_PER_BOT} Media TCP Sockets/Bot = {active_bot_count * SESSIONS_PER_BOT} Parallel Streams")
+          print(f"⚡ Swarm Config: {active_bot_count} Active Bot(s) × {SESSIONS_PER_BOT} Sockets/Bot × {MAX_INFLIGHT_PER_SOCKET} In-Flight/Socket = {active_bot_count * WORKERS_PER_BOT} Parallel Streams")
 
           # Open single read-only file descriptor for lockless os.pread()
           fd = os.open(target_file, os.O_RDONLY)
@@ -284,6 +287,7 @@ jobs:
               def __init__(self, idx: int, token: str):
                   self.idx = idx
                   self.token = token
+                  # sleep_threshold=0 forces FloodWait to bubble up immediately instead of blocking inside Pyrofork
                   self.client = Client(
                       name=f"swarm_bot_{idx}",
                       api_id=API_ID,
@@ -291,56 +295,116 @@ jobs:
                       bot_token=token,
                       in_memory=True,
                       no_updates=True,
-                      sleep_threshold=60
+                      sleep_threshold=0
                   )
-                  self.media_sessions = []
+                  self.dc_id = None
+                  self.auth_key = None
+                  self.test_mode = None
                   self.peer = None
+
+                  self.media_sessions = [None] * SESSIONS_PER_BOT
+                  self.slot_locks = [asyncio.Lock() for _ in range(SESSIONS_PER_BOT)]
+                  self.slot_sems = [asyncio.Semaphore(MAX_INFLIGHT_PER_SOCKET) for _ in range(SESSIONS_PER_BOT)]
+                  self.slot_gens = [0] * SESSIONS_PER_BOT
+                  self.cooldown_until = 0.0
+
+              async def _create_media_session(self) -> Session:
+                  while True:
+                      s = Session(
+                          self.client,
+                          self.dc_id,
+                          self.auth_key,
+                          self.test_mode,
+                          is_media=True
+                      )
+                      try:
+                          await asyncio.wait_for(s.start(), timeout=15.0)
+                          return s
+                      except Exception:
+                          asyncio.create_task(self._safe_discard(s))
+                          await asyncio.sleep(1.0)
+
+              async def _safe_discard(self, old_session: Session):
+                  if old_session is None:
+                      return
+                  try:
+                      await asyncio.wait_for(old_session.stop(), timeout=3.0)
+                  except Exception:
+                      pass
 
               async def start(self):
                   await self.client.start()
                   self.peer = await self.client.resolve_peer(CHAT_ID)
-                  dc_id = await self.client.storage.dc_id()
-                  auth_key = await self.client.storage.auth_key()
-                  test_mode = await self.client.storage.test_mode()
+                  self.dc_id = await self.client.storage.dc_id()
+                  self.auth_key = await self.client.storage.auth_key()
+                  self.test_mode = await self.client.storage.test_mode()
 
-                  # Spin up dedicated MTProto media TCP sockets sharing the same auth_key
-                  for _ in range(SESSIONS_PER_BOT):
-                      s = Session(
-                          self.client,
-                          dc_id,
-                          auth_key,
-                          test_mode,
-                          is_media=True
-                      )
-                      self.media_sessions.append(s)
+                  created = await asyncio.gather(*(self._create_media_session() for _ in range(SESSIONS_PER_BOT)))
+                  for i, s in enumerate(created):
+                      self.media_sessions[i] = s
 
-                  await asyncio.gather(*(s.start() for s in self.media_sessions))
+              async def heal_slot(self, slot_idx: int, failed_gen: int):
+                  # Lock-guarded generation check: if another worker already replaced this slot, return immediately
+                  async with self.slot_locks[slot_idx]:
+                      if self.slot_gens[slot_idx] != failed_gen:
+                          return
+                      old_sess = self.media_sessions[slot_idx]
+                      new_sess = await self._create_media_session()
+                      self.media_sessions[slot_idx] = new_sess
+                      self.slot_gens[slot_idx] += 1
+                      asyncio.create_task(self._safe_discard(old_sess))
+
+              def register_floodwait(self, wait_seconds: float):
+                  target_wakeup = time.monotonic() + wait_seconds + 0.3
+                  if target_wakeup > self.cooldown_until:
+                      self.cooldown_until = target_wakeup
+
+              async def wait_if_cooling_down(self):
+                  while True:
+                      rem = self.cooldown_until - time.monotonic()
+                      if rem <= 0:
+                          return
+                      # Jitter wakeup slightly so all 24 workers don't slam the DC on the exact same millisecond
+                      await asyncio.sleep(rem + random.uniform(0.02, 0.25))
+
+              async def push_part(self, preferred_slot: int, file_id: int, part_idx: int, total_parts: int, offset: int, size: int):
+                  payload = os.pread(fd, size, offset)
+                  query = raw.functions.upload.SaveBigFilePart(
+                      file_id=file_id,
+                      file_part=part_idx,
+                      file_total_parts=total_parts,
+                      bytes=payload
+                  )
+                  attempt = 0
+                  while True:
+                      await self.wait_if_cooling_down()
+                      slot = (preferred_slot + attempt) % SESSIONS_PER_BOT
+
+                      async with self.slot_sems[slot]:
+                          await self.wait_if_cooling_down()
+                          sess = self.media_sessions[slot]
+                          gen = self.slot_gens[slot]
+                          try:
+                              # retries=0 & sleep_threshold=0 disable Pyrofork's buggy internal Session.restart()
+                              # wait_for guarantees a dead socket can never hang forever on is_connected.wait()
+                              await asyncio.wait_for(
+                                  sess.invoke(query, retries=0, timeout=RPC_HARD_TIMEOUT, sleep_threshold=0),
+                                  timeout=RPC_HARD_TIMEOUT + 2.0
+                              )
+                              return
+                          except FloodWait as e:
+                              self.register_floodwait(e.value)
+                          except Exception:
+                              attempt += 1
+                              await self.heal_slot(slot, gen)
+                              await asyncio.sleep(min(0.2 * attempt, 1.5))
 
               async def stop(self):
-                  await asyncio.gather(*(s.stop() for s in self.media_sessions), return_exceptions=True)
-                  await self.client.stop()
-
-
-          async def push_part(sessions, start_slot, file_id, part_idx, total_parts, offset, size):
-              payload = os.pread(fd, size, offset)
-              attempt = 0
-              while True:
-                  session = sessions[(start_slot + attempt) % len(sessions)]
+                  await asyncio.gather(*(self._safe_discard(s) for s in self.media_sessions), return_exceptions=True)
                   try:
-                      await session.invoke(
-                          raw.functions.upload.SaveBigFilePart(
-                              file_id=file_id,
-                              file_part=part_idx,
-                              file_total_parts=total_parts,
-                              bytes=payload
-                          )
-                      )
-                      return
-                  except FloodWait as e:
-                      await asyncio.sleep(e.value + 1)
+                      await asyncio.wait_for(self.client.stop(), timeout=5.0)
                   except Exception:
-                      attempt += 1
-                      await asyncio.sleep(min(0.5 * attempt, 3.0))
+                      pass
 
 
           async def upload_chunk_on_node(node: BotSwarmNode, chunk_idx: int):
@@ -357,6 +421,7 @@ jobs:
 
               async def worker(worker_id: int):
                   nonlocal part_cursor
+                  preferred_slot = worker_id % SESSIONS_PER_BOT
                   while True:
                       p_idx = part_cursor
                       if p_idx >= total_parts:
@@ -364,9 +429,8 @@ jobs:
                       part_cursor += 1
                       p_offset = chunk_offset + (p_idx * PART_SIZE)
                       p_size = min(PART_SIZE, (chunk_offset + this_chunk_size) - p_offset)
-                      await push_part(
-                          node.media_sessions,
-                          worker_id,
+                      await node.push_part(
+                          preferred_slot,
                           file_id,
                           p_idx,
                           total_parts,
@@ -391,7 +455,6 @@ jobs:
           async def main():
               global_start = time.perf_counter()
 
-              # Initialize only as many bots as needed up to total_chunks
               nodes = [BotSwarmNode(i, BOT_TOKENS[i]) for i in range(active_bot_count)]
               await asyncio.gather(*(n.start() for n in nodes))
 
@@ -401,7 +464,6 @@ jobs:
               for c_idx in range(1, total_chunks + 1):
                   chunk_queue.put_nowait(c_idx)
 
-              # Each bot continuously pulls the next unallocated chunk as soon as it finishes one
               async def bot_worker_loop(node: BotSwarmNode):
                   while not chunk_queue.empty():
                       try:
@@ -412,32 +474,41 @@ jobs:
                           res = await upload_chunk_on_node(node, c_idx)
                           chunk_futures[c_idx - 1].set_result(res)
                       except Exception as exc:
-                          chunk_futures[c_idx - 1].set_exception(exc)
+                          if not chunk_futures[c_idx - 1].done():
+                              chunk_futures[c_idx - 1].set_exception(exc)
                           raise
 
-              # Commit messages to the chat in strict sequential order (.001 -> .002 -> .003)
               async def sequential_committer():
                   for c_idx in range(1, total_chunks + 1):
                       node, chunk_filename, input_file = await chunk_futures[c_idx - 1]
                       while True:
+                          await node.wait_if_cooling_down()
                           try:
-                              await node.client.invoke(
-                                  raw.functions.messages.SendMedia(
-                                      peer=node.peer,
-                                      media=raw.types.InputMediaUploadedDocument(
-                                          file=input_file,
-                                          mime_type="application/octet-stream",
-                                          attributes=[raw.types.DocumentAttributeFilename(file_name=chunk_filename)],
-                                          force_file=True
+                              await asyncio.wait_for(
+                                  node.client.invoke(
+                                      raw.functions.messages.SendMedia(
+                                          peer=node.peer,
+                                          media=raw.types.InputMediaUploadedDocument(
+                                              file=input_file,
+                                              mime_type="application/octet-stream",
+                                              attributes=[raw.types.DocumentAttributeFilename(file_name=chunk_filename)],
+                                              force_file=True
+                                          ),
+                                          message=chunk_filename,
+                                          random_id=node.client.rnd_id()
                                       ),
-                                      message=chunk_filename,
-                                      random_id=node.client.rnd_id()
-                                  )
+                                      retries=0,
+                                      timeout=15.0,
+                                      sleep_threshold=0
+                                  ),
+                                  timeout=18.0
                               )
                               print(f"✅ [Committed {c_idx}/{total_chunks}] {chunk_filename} (via Bot #{node.idx + 1})")
                               break
                           except FloodWait as e:
-                              await asyncio.sleep(e.value + 1)
+                              node.register_floodwait(e.value)
+                          except Exception:
+                              await asyncio.sleep(1.5)
 
               await asyncio.gather(
                   sequential_committer(),
