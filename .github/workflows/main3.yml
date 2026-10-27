@@ -32,47 +32,47 @@ jobs:
           docker-images: true
           swap-storage: true
 
+      - name: Cache System and Python Dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          # We cache the staging directory so we don't have to compress it manually
+          path: /tmp/stage_root
+          # Bump 'v1' to 'v2' if you ever change the packages in the future to bust the cache
+          key: ${{ runner.os }}-deps-v1
+
       - name: Install Dependencies
         run: |
           T_START=$(date +%s%3N)
-
-          if git fetch --depth=1 origin deps-cache 2>/dev/null && git checkout FETCH_HEAD -- deps_bundle.tar.zst 2>/dev/null; then
-            echo "⚡ Git Cache HIT! Extracting pre-built binary & Python bundle..."
-            sudo tar --keep-directory-symlink -I zstd -xf deps_bundle.tar.zst -C /
-            rm -f deps_bundle.tar.zst
+          
+          # Check if the cache successfully restored the Python packages
+          if [ -d "/tmp/stage_root/opt/fastdeps/pydeps" ]; then
+            echo "⚡ Cache HIT! Copying pre-built dependencies to root..."
+            # Copy everything directly into the root filesystem
+            sudo cp -a /tmp/stage_root/. /
           else
-            echo "🛠️ Git Cache MISS (First Run Only). Building dependency image and pushing to 'deps-cache' branch..."
+            echo "🛠️ Cache MISS. Downloading and building dependencies..."
             curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
             echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-
             sudo apt-get update
             mkdir -p /tmp/debs /tmp/stage_root/opt/fastdeps/pydeps
-
-            # Download .deb packages and all transitive dependencies without slow dpkg triggers
+            
+            # Download .deb packages
             sudo apt-get install -y --download-only -o Dir::Cache::archives="/tmp/debs" unrar cloudflare-warp
             for deb in /tmp/debs/*.deb; do
               dpkg-deb -x "$deb" /tmp/stage_root
             done
-
-            # Pre-install all Python packages + C extensions into isolated target directory
+            
+            # 🧹 Strip docs and man pages to reduce cache size
+            rm -rf /tmp/stage_root/usr/share/doc /tmp/stage_root/usr/share/man
+            
+            # Pre-install all Python packages
             pip install -U --break-system-packages --target=/tmp/stage_root/opt/fastdeps/pydeps \
               pyrofork tgcrypto requests google-auth tqdm uvloop
             find /tmp/stage_root/opt/fastdeps/pydeps -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-
-            # Compress with multi-threaded zstd (~22 MB bundle) and install to /
-            tar -I "zstd -9 -T0" -cf deps_bundle.tar.zst -C /tmp/stage_root .
-            sudo tar --keep-directory-symlink -I zstd -xf deps_bundle.tar.zst -C /
-
-            # Commit and force-push bundle to orphan branch 'deps-cache'
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git checkout --orphan temp-deps-cache
-            git rm -rf --cached . >/dev/null 2>&1 || true
-            git add -f deps_bundle.tar.zst
-            git commit -m "chore: update prebuilt dependency bundle"
-            git push -f origin temp-deps-cache:refs/heads/deps-cache
-            git checkout -f -
-            rm -rf deps_bundle.tar.zst /tmp/debs /tmp/stage_root
+            
+            echo "Copying built dependencies to root..."
+            sudo cp -a /tmp/stage_root/. /
           fi
 
           # Link shared libraries, start Cloudflare WARP daemon, and expose Python path
@@ -80,7 +80,7 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl start warp-svc || (sudo nohup warp-svc >/dev/null 2>&1 &)
           echo "PYTHONPATH=/opt/fastdeps/pydeps" >> $GITHUB_ENV
-
+          
           T_END=$(date +%s%3N)
           echo "✅ Dependencies ready in $((T_END - T_START)) ms."
 
