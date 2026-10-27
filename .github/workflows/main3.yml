@@ -1,0 +1,262 @@
+name: NUPPPP
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_link:
+        description: 'Direct link to payload (Drive, Torrent, Magnet)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process-queue:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free Up Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install Dependencies
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          
+          # Stripped out ffmpeg, mkvtoolnix, jq
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev unzip unrar cloudflare-warp
+          
+          # Stripped out guessit
+          pip install -U --break-system-packages pyrofork tgcrypto requests google-auth tqdm
+
+      - name: Acknowledge Payload
+        id: payload_ack
+        run: |
+          echo "Target acquired: ${{ inputs.target_link }}"
+          echo "TARGET_LINK=${{ inputs.target_link }}" >> $GITHUB_ENV
+          echo "found=true" >> $GITHUB_ENV
+
+      - name: Download and Extract Payload
+        if: env.found == 'true'
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          mkdir -p workspace
+          echo "Evaluating Payload Type..."
+
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+
+          for i in {1..12}; do
+            if curl -s -x socks5://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then break; fi
+            sleep 5
+          done
+
+          IS_TORRENT=false
+          if [[ "$TARGET_LINK" == magnet:* ]] || [[ "$TARGET_LINK" == *.torrent* ]]; then IS_TORRENT=true; fi
+
+          if [[ "$TARGET_LINK" == *drive.google.com* ]] || [[ "$TARGET_LINK" == *drive.usercontent.google.com* ]]; then
+            if [[ "$TARGET_LINK" == *\&at=* ]] || [[ "$TARGET_LINK" == *confirm=t* ]]; then
+              cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..
+            else
+              cat << 'EOF' > gdrive_sa_dl.py
+          import os, sys, re, json, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+          from tqdm import tqdm
+          link, sa_json_str = sys.argv[1], os.environ.get('GCP_SA_JSON')
+          if not sa_json_str: sys.exit(1)
+          sa_info = json.loads(sa_json_str)
+          creds = service_account.Credentials.from_service_account_info(sa_info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+          creds.refresh(Request())
+          headers = {'Authorization': f'Bearer {creds.token}'}
+          match = re.search(r'(id=|/d/|folders/)([a-zA-Z0-9_-]+)', link)
+          file_id = match.group(2)
+          def download_file(fid, fname):
+              url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+              with requests.get(url, headers=headers, stream=True) as r:
+                  total_size = int(r.headers.get('Content-Length', 0))
+                  with open(os.path.join("workspace", fname), 'wb') as f:
+                      with tqdm(total=total_size, unit='iB', unit_scale=True, desc=fname[:30], ascii=True) as pbar:
+                          for chunk in r.iter_content(chunk_size=1024*1024*10):
+                              if chunk: f.write(chunk); pbar.update(len(chunk))
+          def process_node(fid):
+              res = requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?fields=name,mimeType", headers=headers).json()
+              if res.get('mimeType') == 'application/vnd.google-apps.folder':
+                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false", headers=headers).json().get('files', [])
+                  for child in children: process_node(child['id'])
+              else: download_file(fid, res['name'])
+          process_node(file_id)
+          EOF
+              python3 gdrive_sa_dl.py "$TARGET_LINK"
+            fi
+
+          elif [[ "$IS_TORRENT" == "false" ]] && [[ "$TARGET_LINK" == http* ]]; then
+            HEADERS=$(curl -g -sIL -x socks5h://127.0.0.1:40000 -H 'User-Agent: Mozilla/5.0' "$TARGET_LINK" || true)
+            SERVER_FILENAME=$(python3 -c "import sys, re, urllib.parse; h=sys.stdin.read(); m=re.search(r'(?i)filename\*?=(?:\"?UTF-8\'\'\"?)?([^\r\n;]+)', h); print(urllib.parse.unquote(m.group(1).strip(' \"\'')) if m else 'Direct_Payload.mkv')" <<< "$HEADERS")
+            wget -qO yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && chmod +x yt-dlp
+            ./yt-dlp --proxy "socks5://127.0.0.1:40000" --add-header 'User-Agent: Mozilla/5.0' -N 16 -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+
+          else
+            wget -qO qbittorrent-nox https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox
+            chmod +x qbittorrent-nox
+            mkdir -p ~/.config/qBittorrent
+            cat << EOF_CONF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\Port=8085
+          WebUI\AuthSubnetWhitelistEnabled=true
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32, ::1/128
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=$(pwd)/workspace/
+          BitTorrent\Session\MaxConnections=500
+          BitTorrent\Session\Encryption=1
+          BitTorrent\Session\DHT=true
+          BitTorrent\Session\PeX=true
+          BitTorrent\Session\LSD=false
+          Network\Port=443
+          Proxy\Type=2
+          Proxy\IP=127.0.0.1
+          Proxy\Port=40000
+          Proxy\Enabled=true
+          Proxy\PeerExchange=true
+          Proxy\OnlyForTorrents=false
+          EOF_CONF
+            ./qbittorrent-nox -d --confirm-legal-notice
+            cat << 'EOF_PY' > qbit_monitor.py
+          import time, requests, sys
+          target_link, base_url = sys.argv[1], "http://127.0.0.1:8085/api/v2"
+          for _ in range(30):
+              try: requests.get(f"{base_url}/app/version"); break
+              except: time.sleep(1)
+          requests.post(f"{base_url}/torrents/add", data={'urls': target_link})
+          start_t, last_p = time.time(), -1
+          while True:
+              try:
+                  torrents = requests.get(f"{base_url}/torrents/info").json()
+                  if not torrents: 
+                      if time.time() - start_t > 60: sys.exit(1)
+                      time.sleep(2); continue
+                  t = torrents[0]
+                  if t.get('progress', 0) > last_p: start_t, last_p = time.time(), t.get('progress')
+                  if t.get('progress') == 1.0 or t.get('state') in ['uploading', 'stalledUP']: break
+                  if time.time() - start_t > 600: sys.exit(1)
+                  time.sleep(5)
+              except: time.sleep(2)
+          EOF_PY
+            python3 qbit_monitor.py "$TARGET_LINK"
+            curl -s -X POST http://127.0.0.1:8085/api/v2/app/shutdown || true
+            rm qbittorrent-nox
+          fi
+          warp-cli --accept-tos disconnect
+
+          # Extract RARs and ZIPs
+          find workspace -type f -name "*.zip" -exec unzip -q -o {} -d workspace/ \; -exec rm {} \;
+          while read -u 9 RAR; do
+            unrar e -y "$RAR" workspace/ || true
+            DIR=$(dirname "$RAR")
+            rm -f "$DIR"/*.rar "$DIR"/*.r[0-9][0-9] "$DIR"/*.sfv "$DIR"/*.nfo
+          done 9< <(find workspace -type f -name "*.rar")
+
+      - name: Sequential Stream, Chunk, and Upload to 
+        if: env.found == 'true'
+        env:
+          BG_API_ID: ${{ secrets.BG_API_ID }}
+          BG_API_HASH: ${{ secrets.BG_API_HASH }}
+          BG_BOT_TOKEN: ${{ secrets.BG_BOT_TOKEN }}
+          BG_CHAT_ID: ${{ secrets.BG_CHAT_ID }}
+        run: |
+          cat << 'EOF_PY' > upload_processor.py
+          import os, math, asyncio
+          from pyrogram import Client
+
+          api_id = os.environ.get('BG_API_ID')
+          api_hash = os.environ.get('BG_API_HASH')
+          bot_token = os.environ.get('BG_BOT_TOKEN')
+          chat_id = int(os.environ.get('BG_CHAT_ID'))
+
+          # 1. Locate the single largest file in the workspace
+          # This safely targets the main video/iso/file regardless of extension
+          workspace_dir = 'workspace'
+          all_files = []
+          for root, _, files in os.walk(workspace_dir):
+              for f in files:
+                  all_files.append(os.path.join(root, f))
+                  
+          if not all_files:
+              print("❌ No files found in workspace.")
+              exit(1)
+
+          target_file = max(all_files, key=os.path.getsize)
+          file_size = os.path.getsize(target_file)
+          base_filename = os.path.basename(target_file)
+          
+          print(f"🎬 Target Acquired: {base_filename}")
+          print(f"📦 Total Size: {file_size / (1024**3):.2f} GB")
+
+          CHUNK_SIZE = 1800 * 1024 * 1024  # 1.8 GB
+          total_chunks = math.ceil(file_size / CHUNK_SIZE)
+
+          async def process_and_upload():
+              app = Client("tg_uploader", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
+              await app.start()
+
+              with open(target_file, 'rb') as f_in:
+                  for i in range(1, total_chunks + 1):
+                      # Format suffix as .001, .002, etc.
+                      suffix = f"{i:03d}"
+                      chunk_filename = f"{base_filename}.{suffix}"
+                      chunk_path = os.path.join(workspace_dir, chunk_filename)
+                      
+                      print(f"\n✂️ [Part {i}/{total_chunks}] Slicing up to 1.8GB into {chunk_filename}...")
+                      
+                      # Read/Write loop in 10MB blocks to avoid RAM usage
+                      bytes_written = 0
+                      with open(chunk_path, 'wb') as f_out:
+                          while bytes_written < CHUNK_SIZE:
+                              to_read = min(10 * 1024 * 1024, CHUNK_SIZE - bytes_written)
+                              data = f_in.read(to_read)
+                              if not data:
+                                  break
+                              f_out.write(data)
+                              bytes_written += len(data)
+
+                      print(f"📤 [Part {i}/{total_chunks}] Uploading to ...")
+                      
+                      # Upload as raw document, not media, with filename as caption
+                      await app.send_document(
+                          chat_id=chat_id,
+                          document=chunk_path,
+                          caption=chunk_filename,
+                          file_name=chunk_filename
+                      )
+                      
+                      print(f"✅ [Part {i}/{total_chunks}] Upload complete. Deleting chunk from disk...")
+                      os.remove(chunk_path)  # Immediately free up the 1.8GB to maintain disk space limits
+
+              await app.stop()
+              print("\n🎉 All parts processed and uploaded successfully!")
+
+          # Run the async logic
+          asyncio.run(process_and_upload())
+          EOF_PY
+          
+          # Execute the Python logic
+          python3 upload_processor.py
+
+          # Cleanup the final massive file
+          rm -rf workspace/
