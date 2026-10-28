@@ -221,12 +221,14 @@ jobs:
 
           cat << 'EOF_PY' > upload_processor.py
           import os
+          import re
           import sys
           import math
           import time
           import random
           import asyncio
           import uvloop
+          from dataclasses import dataclass
           from pyrogram import Client, raw
           from pyrogram.session import Session
           from pyrogram.errors import FloodWait
@@ -245,42 +247,137 @@ jobs:
 
           print(f"🤖 Detected {len(BOT_TOKENS)} bot token(s) in current execution run.")
 
-          # Locate target payload
-          workspace_dir = 'workspace'
-          all_files = [
-              os.path.join(root, f)
-              for root, _, files in os.walk(workspace_dir)
-              for f in files
-          ]
-          if not all_files:
-              print("❌ No files found in workspace.")
-              sys.exit(1)
-
-          target_file = max(all_files, key=os.path.getsize)
-          file_size = os.path.getsize(target_file)
-          base_filename = os.path.basename(target_file)
-
           # MTProto maximum geometry: 3990 parts * 512 KiB = 1995.0 MiB per chunk
           PART_SIZE = 512 * 1024
           PARTS_PER_CHUNK = 3990
           CHUNK_SIZE = PARTS_PER_CHUNK * PART_SIZE
-          total_chunks = math.ceil(file_size / CHUNK_SIZE)
+
+          # 1. Target Discovery, Filtering, and Natural Sorting
+          workspace_dir = 'workspace'
+          IGNORED_EXTENSIONS = {'.nfo', '.sfv', '.txt', '.url', '.ds_store', '.zip', '.rar'}
+
+          def is_valid_payload(root: str, filename: str, full_path: str) -> bool:
+              if '__MACOSX' in root or filename.startswith('.'):
+                  return False
+              ext = os.path.splitext(filename)[1].lower()
+              if ext in IGNORED_EXTENSIONS or re.match(r'^\.r\d+$', ext):
+                  return False
+              try:
+                  return os.path.getsize(full_path) > 0
+              except OSError:
+                  return False
+
+          def natural_sort_key(filepath: str):
+              rel_path = os.path.relpath(filepath, workspace_dir)
+              return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)', rel_path)]
+
+          discovered_files = [
+              os.path.join(root, f)
+              for root, _, files in os.walk(workspace_dir)
+              for f in files
+              if is_valid_payload(root, f, os.path.join(root, f))
+          ]
+
+          if not discovered_files:
+              print("❌ No valid payload files found in workspace.")
+              sys.exit(1)
+
+          discovered_files.sort(key=natural_sort_key)
+
+
+          # 2. Per-File Descriptor Management & Flattened Cross-Episode Task Graph
+          class FileTarget:
+              def __init__(self, file_idx: int, filepath: str):
+                  self.file_idx = file_idx
+                  self.filepath = filepath
+                  self.base_filename = os.path.basename(filepath)
+                  self.file_size = os.path.getsize(filepath)
+                  self.total_chunks = max(1, math.ceil(self.file_size / CHUNK_SIZE))
+                  self.remaining_chunks = self.total_chunks
+                  self.fd = None
+
+              def acquire_fd(self) -> int:
+                  if self.fd is None:
+                      self.fd = os.open(self.filepath, os.O_RDONLY)
+                      if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
+                          os.posix_fadvise(self.fd, 0, self.file_size, os.POSIX_FADV_SEQUENTIAL)
+                  return self.fd
+
+              def mark_chunk_done(self):
+                  self.remaining_chunks -= 1
+                  if self.remaining_chunks <= 0 and self.fd is not None:
+                      try:
+                          os.close(self.fd)
+                      except OSError:
+                          pass
+                      self.fd = None
+
+              def force_close(self):
+                  if self.fd is not None:
+                      try:
+                          os.close(self.fd)
+                      except OSError:
+                          pass
+                      self.fd = None
+
+
+          @dataclass
+          class ChunkTask:
+              global_idx: int
+              file_target: FileTarget
+              file_chunk_idx: int
+              chunk_filename: str
+              chunk_offset: int
+              chunk_size: int
+              total_parts: int
+
+
+          file_targets = [FileTarget(idx, path) for idx, path in enumerate(discovered_files, start=1)]
+          total_files = len(file_targets)
+          total_payload_bytes = sum(ft.file_size for ft in file_targets)
+
+          chunk_tasks = []
+          global_counter = 0
+
+          for ft in file_targets:
+              for c_idx in range(1, ft.total_chunks + 1):
+                  global_counter += 1
+                  c_offset = (c_idx - 1) * CHUNK_SIZE
+                  c_size = min(CHUNK_SIZE, ft.file_size - c_offset)
+                  t_parts = max(1, math.ceil(c_size / PART_SIZE))
+
+                  # Conditional extension naming: preserve native filename if single-chunk
+                  if ft.total_chunks == 1:
+                      c_filename = ft.base_filename
+                  else:
+                      c_filename = f"{ft.base_filename}.{c_idx:03d}"
+
+                  chunk_tasks.append(
+                      ChunkTask(
+                          global_idx=global_counter,
+                          file_target=ft,
+                          file_chunk_idx=c_idx,
+                          chunk_filename=c_filename,
+                          chunk_offset=c_offset,
+                          chunk_size=c_size,
+                          total_parts=t_parts
+                      )
+                  )
+
+          total_global_chunks = len(chunk_tasks)
 
           # Anti-throttling & anti-head-of-line-blocking concurrency geometry:
           # 8 TCP Media Sessions per bot, strictly capped at 3 in-flight 512 KiB parts per socket (24 workers/bot)
-          active_bot_count = min(len(BOT_TOKENS), total_chunks)
+          active_bot_count = min(len(BOT_TOKENS), total_global_chunks)
           SESSIONS_PER_BOT = 8
           MAX_INFLIGHT_PER_SOCKET = 3
           WORKERS_PER_BOT = SESSIONS_PER_BOT * MAX_INFLIGHT_PER_SOCKET
           RPC_HARD_TIMEOUT = 12.0
 
-          print(f"🎬 Target: {base_filename} | Size: {file_size / (1024**3):.2f} GiB | Chunks: {total_chunks} (1995 MiB max)")
+          print(f"📦 Discovered {total_files} file(s) | Total Payload: {total_payload_bytes / (1024**3):.2f} GiB | Total Global Chunks: {total_global_chunks}")
+          for ft in file_targets:
+              print(f"   [{ft.file_idx:02d}/{total_files:02d}] {ft.base_filename} ({ft.file_size / (1024**3):.2f} GiB -> {ft.total_chunks} chunk(s))")
           print(f"⚡ Swarm Config: {active_bot_count} Active Bot(s) × {SESSIONS_PER_BOT} Sockets/Bot × {MAX_INFLIGHT_PER_SOCKET} In-Flight/Socket = {active_bot_count * WORKERS_PER_BOT} Parallel Streams")
-
-          # Open single read-only file descriptor for lockless os.pread()
-          fd = os.open(target_file, os.O_RDONLY)
-          if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
-              os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
 
 
           class BotSwarmNode:
@@ -367,7 +464,7 @@ jobs:
                       # Jitter wakeup slightly so all 24 workers don't slam the DC on the exact same millisecond
                       await asyncio.sleep(rem + random.uniform(0.02, 0.25))
 
-              async def push_part(self, preferred_slot: int, file_id: int, part_idx: int, total_parts: int, offset: int, size: int):
+              async def push_part(self, fd: int, preferred_slot: int, file_id: int, part_idx: int, total_parts: int, offset: int, size: int):
                   payload = os.pread(fd, size, offset)
                   query = raw.functions.upload.SaveBigFilePart(
                       file_id=file_id,
@@ -407,15 +504,17 @@ jobs:
                       pass
 
 
-          async def upload_chunk_on_node(node: BotSwarmNode, chunk_idx: int):
+          async def upload_chunk_on_node(node: BotSwarmNode, task: ChunkTask):
               t0 = time.perf_counter()
-              chunk_filename = f"{base_filename}.{chunk_idx:03d}"
-              chunk_offset = (chunk_idx - 1) * CHUNK_SIZE
-              this_chunk_size = min(CHUNK_SIZE, file_size - chunk_offset)
-              total_parts = math.ceil(this_chunk_size / PART_SIZE)
+              ft = task.file_target
+              fd = ft.acquire_fd()
               file_id = random.getrandbits(63)
 
-              print(f"🚀 [Bot #{node.idx + 1}] Pre-uploading Part {chunk_idx}/{total_chunks} ({this_chunk_size / (1024**2):.1f} MiB, {total_parts} parts)...")
+              print(
+                  f"🚀 [Bot #{node.idx + 1}] [Global {task.global_idx}/{total_global_chunks} | "
+                  f"File {ft.file_idx}/{total_files} Part {task.file_chunk_idx}/{ft.total_chunks}] "
+                  f"Pre-uploading {task.chunk_filename} ({task.chunk_size / (1024**2):.1f} MiB, {task.total_parts} parts)..."
+              )
 
               part_cursor = 0
 
@@ -424,32 +523,37 @@ jobs:
                   preferred_slot = worker_id % SESSIONS_PER_BOT
                   while True:
                       p_idx = part_cursor
-                      if p_idx >= total_parts:
+                      if p_idx >= task.total_parts:
                           return
                       part_cursor += 1
-                      p_offset = chunk_offset + (p_idx * PART_SIZE)
-                      p_size = min(PART_SIZE, (chunk_offset + this_chunk_size) - p_offset)
+                      p_offset = task.chunk_offset + (p_idx * PART_SIZE)
+                      p_size = min(PART_SIZE, (task.chunk_offset + task.chunk_size) - p_offset)
                       await node.push_part(
+                          fd,
                           preferred_slot,
                           file_id,
                           p_idx,
-                          total_parts,
+                          task.total_parts,
                           p_offset,
                           p_size
                       )
 
               await asyncio.gather(*(worker(w) for w in range(WORKERS_PER_BOT)))
+              ft.mark_chunk_done()
 
               elapsed = max(0.001, time.perf_counter() - t0)
-              mbps = (this_chunk_size / (1024 * 1024)) / elapsed
-              print(f"⚡ [Bot #{node.idx + 1}] Finished Part {chunk_idx}/{total_chunks} in {elapsed:.1f}s ({mbps:.1f} MiB/s)")
+              mbps = (task.chunk_size / (1024 * 1024)) / elapsed
+              print(
+                  f"⚡ [Bot #{node.idx + 1}] [Global {task.global_idx}/{total_global_chunks}] "
+                  f"Finished {task.chunk_filename} in {elapsed:.1f}s ({mbps:.1f} MiB/s)"
+              )
 
               input_file = raw.types.InputFileBig(
                   id=file_id,
-                  parts=total_parts,
-                  name=chunk_filename
+                  parts=task.total_parts,
+                  name=task.chunk_filename
               )
-              return node, chunk_filename, input_file
+              return node, task, input_file
 
 
           async def main():
@@ -459,28 +563,29 @@ jobs:
               await asyncio.gather(*(n.start() for n in nodes))
 
               loop = asyncio.get_running_loop()
-              chunk_futures = [loop.create_future() for _ in range(total_chunks)]
+              chunk_futures = [loop.create_future() for _ in range(total_global_chunks)]
               chunk_queue = asyncio.Queue()
-              for c_idx in range(1, total_chunks + 1):
-                  chunk_queue.put_nowait(c_idx)
+              for task in chunk_tasks:
+                  chunk_queue.put_nowait(task)
 
               async def bot_worker_loop(node: BotSwarmNode):
                   while not chunk_queue.empty():
                       try:
-                          c_idx = chunk_queue.get_nowait()
+                          task = chunk_queue.get_nowait()
                       except asyncio.QueueEmpty:
                           return
                       try:
-                          res = await upload_chunk_on_node(node, c_idx)
-                          chunk_futures[c_idx - 1].set_result(res)
+                          res = await upload_chunk_on_node(node, task)
+                          chunk_futures[task.global_idx - 1].set_result(res)
                       except Exception as exc:
-                          if not chunk_futures[c_idx - 1].done():
-                              chunk_futures[c_idx - 1].set_exception(exc)
+                          if not chunk_futures[task.global_idx - 1].done():
+                              chunk_futures[task.global_idx - 1].set_exception(exc)
                           raise
 
               async def sequential_committer():
-                  for c_idx in range(1, total_chunks + 1):
-                      node, chunk_filename, input_file = await chunk_futures[c_idx - 1]
+                  for g_idx in range(1, total_global_chunks + 1):
+                      node, task, input_file = await chunk_futures[g_idx - 1]
+                      ft = task.file_target
                       while True:
                           await node.wait_if_cooling_down()
                           try:
@@ -491,10 +596,10 @@ jobs:
                                           media=raw.types.InputMediaUploadedDocument(
                                               file=input_file,
                                               mime_type="application/octet-stream",
-                                              attributes=[raw.types.DocumentAttributeFilename(file_name=chunk_filename)],
+                                              attributes=[raw.types.DocumentAttributeFilename(file_name=task.chunk_filename)],
                                               force_file=True
                                           ),
-                                          message=chunk_filename,
+                                          message=task.chunk_filename,
                                           random_id=node.client.rnd_id()
                                       ),
                                       retries=0,
@@ -503,24 +608,33 @@ jobs:
                                   ),
                                   timeout=18.0
                               )
-                              print(f"✅ [Committed {c_idx}/{total_chunks}] {chunk_filename} (via Bot #{node.idx + 1})")
+                              print(
+                                  f"✅ [Committed {g_idx}/{total_global_chunks} | "
+                                  f"File {ft.file_idx}/{total_files} ({task.file_chunk_idx}/{ft.total_chunks})] "
+                                  f"{task.chunk_filename} (via Bot #{node.idx + 1})"
+                              )
                               break
                           except FloodWait as e:
                               node.register_floodwait(e.value)
                           except Exception:
                               await asyncio.sleep(1.5)
 
-              await asyncio.gather(
-                  sequential_committer(),
-                  *(bot_worker_loop(n) for n in nodes)
-              )
-
-              os.close(fd)
-              await asyncio.gather(*(n.stop() for n in nodes))
+              try:
+                  await asyncio.gather(
+                      sequential_committer(),
+                      *(bot_worker_loop(n) for n in nodes)
+                  )
+              finally:
+                  for ft in file_targets:
+                      ft.force_close()
+                  await asyncio.gather(*(n.stop() for n in nodes))
 
               total_elapsed = max(0.001, time.perf_counter() - global_start)
-              agg_speed = (file_size / (1024 * 1024)) / total_elapsed
-              print(f"\n🎉 All {total_chunks} chunks uploaded & committed in {total_elapsed:.1f}s (Effective: {agg_speed:.1f} MiB/s)!")
+              agg_speed = (total_payload_bytes / (1024 * 1024)) / total_elapsed
+              print(
+                  f"\n🎉 All {total_files} file(s) ({total_global_chunks} total chunks) "
+                  f"uploaded & committed in {total_elapsed:.1f}s (Effective: {agg_speed:.1f} MiB/s)!"
+              )
 
           asyncio.run(main())
           EOF_PY
