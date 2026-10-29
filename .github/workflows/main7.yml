@@ -691,6 +691,10 @@ jobs:
                       no_updates=True,
                       sleep_threshold=0
                   )
+                  # Hard-disable handle_updates so background update tasks never touch SQLite or consume event loop time
+                  async def _ignore_updates(*args, **kwargs):
+                      pass
+                  self.client.handle_updates = _ignore_updates
                   self.dc_id = None
                   self.auth_key = None
                   self.test_mode = None
@@ -880,16 +884,18 @@ jobs:
                           try:
                               await asyncio.wait_for(
                                   node.client.invoke(
-                                      raw.functions.messages.SendMedia(
-                                          peer=node.peer,
-                                          media=raw.types.InputMediaUploadedDocument(
-                                              file=input_file,
-                                              mime_type="application/octet-stream",
-                                              attributes=[raw.types.DocumentAttributeFilename(file_name=chunk_filename)],
-                                              force_file=True
-                                          ),
-                                          message=chunk_filename,
-                                          random_id=node.client.rnd_id()
+                                      raw.functions.InvokeWithoutUpdates(
+                                          query=raw.functions.messages.SendMedia(
+                                              peer=node.peer,
+                                              media=raw.types.InputMediaUploadedDocument(
+                                                  file=input_file,
+                                                  mime_type="application/octet-stream",
+                                                  attributes=[raw.types.DocumentAttributeFilename(file_name=chunk_filename)],
+                                                  force_file=True
+                                              ),
+                                              message=chunk_filename,
+                                              random_id=node.client.rnd_id()
+                                          )
                                       ),
                                       retries=0,
                                       timeout=15.0,
