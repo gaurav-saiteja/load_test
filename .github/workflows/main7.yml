@@ -237,11 +237,32 @@ jobs:
           import re
           import json
           import time
+          import ctypes
           import shutil
           import subprocess
           from collections import deque
 
           WORKSPACE_DIR = "workspace"
+
+          # Bind directly to glibc fallocate64 with 64-bit offsets (supports files > 85 GiB)
+          FALLOC_FL_KEEP_SIZE = 0x01
+          FALLOC_FL_PUNCH_HOLE = 0x02
+          PUNCH_MODE = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
+
+          try:
+              _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+              _fallocate64 = getattr(_libc, "fallocate64", getattr(_libc, "fallocate"))
+              _fallocate64.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
+              _fallocate64.restype = ctypes.c_int
+
+              def linux_fallocate(fd: int, mode: int, offset: int, length: int):
+                  res = _fallocate64(fd, mode, offset, length)
+                  if res != 0:
+                      err = ctypes.get_errno()
+                      raise OSError(err, os.strerror(err) if err else "fallocate64 syscall failed")
+          except Exception as e:
+              print(f"⚠️ Could not bind libc.fallocate64 ({e})")
+              linux_fallocate = None
 
           # 1. Locate target movie file and purge any non-target ancillary files to maximize disk headroom
           all_files = [
@@ -253,14 +274,14 @@ jobs:
               print("❌ No files found in workspace.")
               sys.exit(1)
 
-          target_file = os.path.abspath(max(all_files, key=os.path.getsize))
+          target_file = os.path.realpath(max(all_files, key=os.path.getsize))
           removed_extra_bytes = 0
           for fpath in all_files:
-              abs_p = os.path.abspath(fpath)
-              if abs_p != target_file:
+              real_p = os.path.realpath(fpath)
+              if real_p != target_file:
                   try:
-                      removed_extra_bytes += os.path.getsize(abs_p)
-                      os.remove(abs_p)
+                      removed_extra_bytes += os.path.getsize(real_p)
+                      os.remove(real_p)
                   except OSError:
                       pass
 
@@ -268,6 +289,8 @@ jobs:
               print(f"🧹 Purged {removed_extra_bytes / (1024**2):.1f} MiB of ancillary non-movie files from workspace.")
 
           orig_size = os.path.getsize(target_file)
+          target_stat = os.stat(target_file)
+          target_inode_id = (target_stat.st_dev, target_stat.st_ino)
           free_before = shutil.disk_usage(WORKSPACE_DIR).free
           print(f"🎬 Inspecting: {os.path.basename(target_file)} ({orig_size / (1024**3):.2f} GiB) | Free Disk: {free_before / (1024**3):.2f} GiB")
 
@@ -331,7 +354,6 @@ jobs:
               low = lang_str.strip().lower()
               if low in {"und", "unk", "unknown", "zxx", "mis", "mul", "none", "n/a"}:
                   return set()
-              # Extract full string and primary subtag before '-', '_', or '(' (e.g. 'en-us' -> 'en')
               primary = re.split(r"[-_\s(]", low)[0]
               return {low, primary}
 
@@ -354,7 +376,6 @@ jobs:
           other_drop = []
 
           for s in streams:
-              idx = s.get("index")
               ctype = (s.get("codec_type") or "").lower()
               cname = (s.get("codec_name") or "unknown").lower()
               disp = s.get("disposition") or {}
@@ -389,10 +410,8 @@ jobs:
                       sub_keep.append(s)
 
               else:
-                  # Attachments (fonts) and data streams
                   other_drop.append((s, f"stream type '{ctype}' ({cname})"))
 
-          # Safety fallback if all video streams were flagged attached_pic
           if not video_keep and video_drop:
               video_keep.append(video_drop.pop(0)[0])
 
@@ -462,45 +481,41 @@ jobs:
 
           cmd += ["-max_muxing_queue_size", "9999", temp_output]
 
-          # 4. Execute ffmpeg with adaptive in-place sparse hole-punching when disk headroom is tight
-          FALLOC_FL_KEEP_SIZE = 0x01
-          FALLOC_FL_PUNCH_HOLE = 0x02
-          PUNCH_MODE = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
-
+          # 4. Execute ffmpeg with live in-place sparse hole-punching via glibc fallocate64
           MB = 1024 * 1024
           GB = 1024 * MB
-          HEADER_KEEP = 128 * MB
-          FOOTER_KEEP = 128 * MB
-          SAFETY_LAG = 2 * GB
-          MIN_PUNCH_STEP = 256 * MB
+          HEADER_KEEP = 64 * MB
+          FOOTER_KEEP = 64 * MB
+          SAFETY_LAG = 512 * MB
+          MIN_PUNCH_STEP = 128 * MB
 
-          use_hole_punch = free_before < (orig_size + 10 * GB)
-          print(f"🚀 Starting stream-copy remux (Live Sparse Hole-Punching: {'ENABLED' if use_hole_punch else 'DISABLED - ample free space'})...")
+          punch_fd = None
+          if linux_fallocate is not None and orig_size > (HEADER_KEEP + FOOTER_KEEP + SAFETY_LAG):
+              try:
+                  punch_fd = os.open(target_file, os.O_RDWR)
+              except OSError as e:
+                  print(f"⚠️ Could not open input RDWR for hole-punching ({e}); proceeding with standard remux.")
+                  punch_fd = None
+
+          print(f"🚀 Starting stream-copy remux (Live Sparse Hole-Punching: {'ACTIVE' if punch_fd is not None else 'INACTIVE'})...")
 
           t0 = time.perf_counter()
           proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
 
-          punch_fd = None
           punched_up_to = HEADER_KEEP
           total_punched = 0
-          recent_positions = deque(maxlen=100)  # 100 samples @ 20ms = 2.0s rolling window
+          next_log_threshold = 10 * GB
+          recent_positions = deque(maxlen=15)  # 15 samples @ 10ms = 150ms smoothing window
 
-          if use_hole_punch and hasattr(os, "fallocate") and orig_size > (HEADER_KEEP + FOOTER_KEEP + SAFETY_LAG):
-              try:
-                  punch_fd = os.open(target_file, os.O_RDWR)
-              except OSError as e:
-                  print(f"⚠️ Could not open input for hole-punching ({e}); proceeding with standard remux.")
-                  punch_fd = None
-
-          def get_ffmpeg_min_read_pos(pid: int, target_abs: str):
+          def get_ffmpeg_min_read_pos(pid: int):
               fd_dir = f"/proc/{pid}/fd"
               fdinfo_dir = f"/proc/{pid}/fdinfo"
               positions = []
               try:
                   for fd_name in os.listdir(fd_dir):
                       try:
-                          link_target = os.readlink(f"{fd_dir}/{fd_name}")
-                          if link_target == target_abs:
+                          st = os.stat(f"{fd_dir}/{fd_name}")
+                          if (st.st_dev, st.st_ino) == target_inode_id:
                               with open(f"{fdinfo_dir}/{fd_name}", "r") as f:
                                   for line in f:
                                       if line.startswith("pos:"):
@@ -515,31 +530,37 @@ jobs:
           try:
               while proc.poll() is None:
                   if punch_fd is not None:
-                      # Wait until temp_output has passed initial header probing (>= 64 MiB written)
                       try:
                           out_sz = os.path.getsize(temp_output) if os.path.exists(temp_output) else 0
                       except OSError:
                           out_sz = 0
 
-                      if out_sz >= 64 * MB:
-                          cur_pos = get_ffmpeg_min_read_pos(proc.pid, target_file)
+                      # Once 32 MiB is written to temp_output, header/Cues probing is finished
+                      if out_sz >= 32 * MB:
+                          cur_pos = get_ffmpeg_min_read_pos(proc.pid)
                           if cur_pos is not None and cur_pos >= HEADER_KEEP:
                               recent_positions.append(cur_pos)
-                              if len(recent_positions) == recent_positions.maxlen:
+                              if len(recent_positions) >= 5:
                                   safe_read_pos = min(recent_positions)
                                   raw_limit = min(orig_size - FOOTER_KEEP, safe_read_pos - SAFETY_LAG)
                                   aligned_limit = (raw_limit // MB) * MB
                                   if aligned_limit - punched_up_to >= MIN_PUNCH_STEP:
                                       punch_len = aligned_limit - punched_up_to
                                       try:
-                                          os.fallocate(punch_fd, PUNCH_MODE, punched_up_to, punch_len)
+                                          linux_fallocate(punch_fd, PUNCH_MODE, punched_up_to, punch_len)
+                                          if total_punched == 0:
+                                              print(f"  ⚡ First hole-punch succeeded: deallocated {punch_len / MB:.0f} MiB at offset {punched_up_to / MB:.0f} MiB")
                                           total_punched += punch_len
                                           punched_up_to = aligned_limit
-                                      except OSError:
-                                          # Disable further attempts if filesystem does not support punch_hole
+                                          if total_punched >= next_log_threshold:
+                                              free_now = shutil.disk_usage(WORKSPACE_DIR).free
+                                              print(f"  ♻️ Hole-Punched: {total_punched / GB:.2f} GiB | Temp Out: {out_sz / GB:.2f} GiB | Free Disk: {free_now / GB:.2f} GiB")
+                                              next_log_threshold += 10 * GB
+                                      except OSError as e:
+                                          print(f"  ⚠️ fallocate64 punch failed ({e}); disabling further hole-punching.")
                                           os.close(punch_fd)
                                           punch_fd = None
-                  time.sleep(0.02)
+                  time.sleep(0.01)
           finally:
               if punch_fd is not None:
                   try:
@@ -562,13 +583,13 @@ jobs:
 
           new_size = os.path.getsize(temp_output)
           os.replace(temp_output, target_file)
-          saved_gib = (orig_size - new_size) / (1024**3)
+          saved_gib = (orig_size - new_size) / GB
           speed_mibs = (new_size / MB) / elapsed
 
           print(
               f"✅ Remux complete in {elapsed:.1f}s ({speed_mibs:.1f} MiB/s) | "
-              f"Size: {orig_size / (1024**3):.2f} GiB -> {new_size / (1024**3):.2f} GiB "
-              f"(Stripped {saved_gib:.2f} GiB of bloat, In-Flight Hole-Punched: {total_punched / (1024**3):.2f} GiB)"
+              f"Size: {orig_size / GB:.2f} GiB -> {new_size / GB:.2f} GiB "
+              f"(Stripped {saved_gib:.2f} GiB of bloat, In-Flight Hole-Punched: {total_punched / GB:.2f} GiB)"
           )
           EOF_BLOAT
 
