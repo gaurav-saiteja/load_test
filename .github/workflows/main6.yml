@@ -1,0 +1,880 @@
+name: NUPPPP 6
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_link:
+        description: 'Direct link to payload (Drive, Torrent, Magnet)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process-queue:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache System and Python Dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          # We cache the staging directory so we don't have to compress it manually
+          path: /tmp/stage_root
+          # Bump 'v1' to 'v2' if you ever change the packages in the future to bust the cache
+          key: ${{ runner.os }}-deps-v1
+
+      - name: Install Dependencies
+        run: |
+          T_START=$(date +%s%3N)
+          
+          # Check if the cache successfully restored the Python packages
+          if [ -d "/tmp/stage_root/opt/fastdeps/pydeps" ]; then
+            echo "⚡ Cache HIT! Copying pre-built dependencies to root..."
+            # Use tar to safely copy files into system symlinks like /bin and /lib
+            sudo tar -cf - -C /tmp/stage_root . | sudo tar --keep-directory-symlink -xf - -C /
+          else
+            echo "🛠️ Cache MISS. Downloading and building dependencies..."
+            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+            sudo apt-get update
+            mkdir -p /tmp/debs /tmp/stage_root/opt/fastdeps/pydeps
+            
+            # Download .deb packages
+            sudo apt-get install -y --download-only -o Dir::Cache::archives="/tmp/debs" unrar cloudflare-warp
+            for deb in /tmp/debs/*.deb; do
+              dpkg-deb -x "$deb" /tmp/stage_root
+            done
+            
+            # 🧹 Strip docs and man pages to reduce cache size
+            rm -rf /tmp/stage_root/usr/share/doc /tmp/stage_root/usr/share/man
+            
+            # Pre-install all Python packages
+            pip install -U --break-system-packages --target=/tmp/stage_root/opt/fastdeps/pydeps \
+              pyrofork tgcrypto requests google-auth tqdm uvloop
+            find /tmp/stage_root/opt/fastdeps/pydeps -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+            
+            echo "Copying built dependencies to root..."
+            sudo tar -cf - -C /tmp/stage_root . | sudo tar --keep-directory-symlink -xf - -C /
+          fi
+
+          # Link shared libraries, start Cloudflare WARP daemon, and expose Python path
+          sudo ldconfig
+          sudo systemctl daemon-reload
+          sudo systemctl start warp-svc || (sudo nohup warp-svc >/dev/null 2>&1 &)
+          echo "PYTHONPATH=/opt/fastdeps/pydeps" >> $GITHUB_ENV
+          
+          T_END=$(date +%s%3N)
+          echo "✅ Dependencies ready in $((T_END - T_START)) ms."
+
+      - name: Acknowledge Payload
+        id: payload_ack
+        run: |
+          echo "Target acquired: ${{ inputs.target_link }}"
+          echo "TARGET_LINK=${{ inputs.target_link }}" >> $GITHUB_ENV
+          echo "found=true" >> $GITHUB_ENV
+
+      - name: Download and Extract Payload
+        if: env.found == 'true'
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          mkdir -p workspace
+          echo "Evaluating Payload Type..."
+
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+
+          for i in {1..12}; do
+            if curl -s -x socks5://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then break; fi
+            sleep 5
+          done
+
+          IS_TORRENT=false
+          if [[ "$TARGET_LINK" == magnet:* ]] || [[ "$TARGET_LINK" == *.torrent* ]]; then IS_TORRENT=true; fi
+
+          if [[ "$TARGET_LINK" == *drive.google.com* ]] || [[ "$TARGET_LINK" == *drive.usercontent.google.com* ]]; then
+            if [[ "$TARGET_LINK" == *\&at=* ]] || [[ "$TARGET_LINK" == *confirm=t* ]]; then
+              cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..
+            else
+              cat << 'EOF' > gdrive_sa_dl.py
+          import os, sys, re, json, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+          from tqdm import tqdm
+          link, sa_json_str = sys.argv[1], os.environ.get('GCP_SA_JSON')
+          if not sa_json_str: sys.exit(1)
+          sa_info = json.loads(sa_json_str)
+          creds = service_account.Credentials.from_service_account_info(sa_info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+          creds.refresh(Request())
+          headers = {'Authorization': f'Bearer {creds.token}'}
+          match = re.search(r'(id=|/d/|folders/)([a-zA-Z0-9_-]+)', link)
+          file_id = match.group(2)
+          def download_file(fid, fname):
+              url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+              with requests.get(url, headers=headers, stream=True) as r:
+                  total_size = int(r.headers.get('Content-Length', 0))
+                  with open(os.path.join("workspace", fname), 'wb') as f:
+                      with tqdm(total=total_size, unit='iB', unit_scale=True, desc=fname[:30], ascii=True) as pbar:
+                          for chunk in r.iter_content(chunk_size=1024*1024*10):
+                              if chunk: f.write(chunk); pbar.update(len(chunk))
+          def process_node(fid):
+              res = requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?fields=name,mimeType", headers=headers).json()
+              if res.get('mimeType') == 'application/vnd.google-apps.folder':
+                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false", headers=headers).json().get('files', [])
+                  for child in children: process_node(child['id'])
+              else: download_file(fid, res['name'])
+          process_node(file_id)
+          EOF
+              python3 gdrive_sa_dl.py "$TARGET_LINK"
+            fi
+
+          elif [[ "$IS_TORRENT" == "false" ]] && [[ "$TARGET_LINK" == http* ]]; then
+            HEADERS=$(curl -g -sIL -x socks5h://127.0.0.1:40000 -H 'User-Agent: Mozilla/5.0' "$TARGET_LINK" || true)
+            SERVER_FILENAME=$(python3 -c "import sys, re, urllib.parse; h=sys.stdin.read(); m=re.search(r'(?i)filename\*?=(?:\"?UTF-8\'\'\"?)?([^\r\n;]+)', h); print(urllib.parse.unquote(m.group(1).strip(' \"\'')) if m else 'Direct_Payload.mkv')" <<< "$HEADERS")
+            wget -qO yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && chmod +x yt-dlp
+            ./yt-dlp --proxy "socks5://127.0.0.1:40000" --add-header 'User-Agent: Mozilla/5.0' -N 16 -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+
+          else
+            wget -qO qbittorrent-nox https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox
+            chmod +x qbittorrent-nox
+            mkdir -p ~/.config/qBittorrent
+            cat << EOF_CONF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\Port=8085
+          WebUI\AuthSubnetWhitelistEnabled=true
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32, ::1/128
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=$(pwd)/workspace/
+          BitTorrent\Session\MaxConnections=500
+          BitTorrent\Session\Encryption=1
+          BitTorrent\Session\DHT=true
+          BitTorrent\Session\PeX=true
+          BitTorrent\Session\LSD=false
+          Network\Port=443
+          Proxy\Type=2
+          Proxy\IP=127.0.0.1
+          Proxy\Port=40000
+          Proxy\Enabled=true
+          Proxy\PeerExchange=true
+          Proxy\OnlyForTorrents=false
+          EOF_CONF
+            ./qbittorrent-nox -d --confirm-legal-notice
+            cat << 'EOF_PY' > qbit_monitor.py
+          import time, requests, sys
+          target_link, base_url = sys.argv[1], "http://127.0.0.1:8085/api/v2"
+          for _ in range(30):
+              try: requests.get(f"{base_url}/app/version"); break
+              except: time.sleep(1)
+          requests.post(f"{base_url}/torrents/add", data={'urls': target_link})
+          start_t, last_p = time.time(), -1
+          while True:
+              try:
+                  torrents = requests.get(f"{base_url}/torrents/info").json()
+                  if not torrents: 
+                      if time.time() - start_t > 60: sys.exit(1)
+                      time.sleep(2); continue
+                  t = torrents[0]
+                  if t.get('progress', 0) > last_p: start_t, last_p = time.time(), t.get('progress')
+                  if t.get('progress') == 1.0 or t.get('state') in ['uploading', 'stalledUP']: break
+                  if time.time() - start_t > 600: sys.exit(1)
+                  time.sleep(5)
+              except: time.sleep(2)
+          EOF_PY
+            python3 qbit_monitor.py "$TARGET_LINK"
+            curl -s -X POST http://127.0.0.1:8085/api/v2/app/shutdown || true
+            rm qbittorrent-nox
+          fi
+          warp-cli --accept-tos disconnect
+
+          # Extract RARs and ZIPs
+          find workspace -type f -name "*.zip" -exec unzip -q -o {} -d workspace/ \; -exec rm {} \;
+          while read -u 9 RAR; do
+            unrar e -y "$RAR" workspace/ || true
+            DIR=$(dirname "$RAR")
+            rm -f "$DIR"/*.rar "$DIR"/*.r[0-9][0-9] "$DIR"/*.sfv "$DIR"/*.nfo
+          done 9< <(find workspace -type f -name "*.rar")
+
+      - name: Strip Audio and Subtitle Track Bloat
+        if: env.found == 'true'
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+
+          cat << 'EOF_BLOAT' > strip_bloat.py
+          import os
+          import sys
+          import re
+          import json
+          import time
+          import shutil
+          import subprocess
+          from collections import deque
+
+          WORKSPACE_DIR = "workspace"
+
+          # 1. Locate target movie file and purge any non-target ancillary files to maximize disk headroom
+          all_files = [
+              os.path.join(root, f)
+              for root, _, files in os.walk(WORKSPACE_DIR)
+              for f in files
+          ]
+          if not all_files:
+              print("❌ No files found in workspace.")
+              sys.exit(1)
+
+          target_file = os.path.abspath(max(all_files, key=os.path.getsize))
+          removed_extra_bytes = 0
+          for fpath in all_files:
+              abs_p = os.path.abspath(fpath)
+              if abs_p != target_file:
+                  try:
+                      removed_extra_bytes += os.path.getsize(abs_p)
+                      os.remove(abs_p)
+                  except OSError:
+                      pass
+
+          if removed_extra_bytes > 0:
+              print(f"🧹 Purged {removed_extra_bytes / (1024**2):.1f} MiB of ancillary non-movie files from workspace.")
+
+          orig_size = os.path.getsize(target_file)
+          free_before = shutil.disk_usage(WORKSPACE_DIR).free
+          print(f"🎬 Inspecting: {os.path.basename(target_file)} ({orig_size / (1024**3):.2f} GiB) | Free Disk: {free_before / (1024**3):.2f} GiB")
+
+          # 2. Probe streams and chapters via ffprobe
+          probe_cmd = [
+              "ffprobe", "-v", "quiet",
+              "-print_format", "json",
+              "-show_streams", "-show_chapters",
+              target_file
+          ]
+          try:
+              probe_out = subprocess.check_output(probe_cmd, text=True)
+              probe_data = json.loads(probe_out)
+          except Exception as e:
+              print(f"⚠️ ffprobe failed ({e}); passing file through untouched.")
+              sys.exit(0)
+
+          streams = probe_data.get("streams", [])
+          chapters = probe_data.get("chapters", [])
+          if not streams:
+              print("⚠️ No streams detected by ffprobe; passing file through untouched.")
+              sys.exit(0)
+
+          # Language and codec match tables
+          ALLOWED_AUDIO_LANGS = {
+              # English
+              "en", "eng", "english",
+              # Hindi
+              "hi", "hin", "hindi",
+              # Tamil
+              "ta", "tam", "tamil",
+              # Telugu
+              "te", "tel", "telugu",
+              # Malayalam
+              "ml", "mal", "malayalam",
+              # Korean
+              "ko", "kor", "korean",
+              # Japanese
+              "ja", "jpn", "japanese",
+          }
+
+          ALLOWED_SUB_LANGS = {"en", "eng", "english"}
+
+          ALLOWED_TEXT_SUB_CODECS = {
+              "subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text", "ttml"
+          }
+
+          COMMENTARY_RE = re.compile(
+              r"\b(commentary|commentaries|director'?s\s*comment|cast\s*comment|crew\s*comment|"
+              r"audio\s*description|descriptive\s*audio|visually\s*impaired|sdh\s*audio)\b",
+              re.IGNORECASE
+          )
+
+          def get_tags(stream: dict) -> dict:
+              raw_tags = stream.get("tags") or {}
+              return {str(k).lower(): str(v).strip() for k, v in raw_tags.items()}
+
+          def normalize_lang_tokens(lang_str: str) -> set:
+              if not lang_str:
+                  return set()
+              low = lang_str.strip().lower()
+              if low in {"und", "unk", "unknown", "zxx", "mis", "mul", "none", "n/a"}:
+                  return set()
+              # Extract full string and primary subtag before '-', '_', or '(' (e.g. 'en-us' -> 'en')
+              primary = re.split(r"[-_\s(]", low)[0]
+              return {low, primary}
+
+          def is_commentary_audio(stream: dict, tags: dict) -> bool:
+              disp = stream.get("disposition") or {}
+              if (
+                  disp.get("comment", 0) == 1
+                  or disp.get("visual_impaired", 0) == 1
+                  or disp.get("descriptions", 0) == 1
+              ):
+                  return True
+              title = tags.get("title", "")
+              if title and COMMENTARY_RE.search(title):
+                  return True
+              return False
+
+          video_keep, video_drop = [], []
+          audio_all, audio_keep, audio_drop = [], [], []
+          sub_keep, sub_drop = [], []
+          other_drop = []
+
+          for s in streams:
+              idx = s.get("index")
+              ctype = (s.get("codec_type") or "").lower()
+              cname = (s.get("codec_name") or "unknown").lower()
+              disp = s.get("disposition") or {}
+              tags = get_tags(s)
+              lang_raw = tags.get("language", "")
+              title_raw = tags.get("title", "")
+              lang_tokens = normalize_lang_tokens(lang_raw)
+
+              if ctype == "video":
+                  if disp.get("attached_pic", 0) == 1:
+                      video_drop.append((s, "attached cover art"))
+                  else:
+                      video_keep.append(s)
+
+              elif ctype == "audio":
+                  audio_all.append(s)
+                  if is_commentary_audio(s, tags):
+                      audio_drop.append((s, f"commentary/descriptive ({lang_raw or 'und'}: {title_raw or cname})"))
+                  elif not (lang_tokens & ALLOWED_AUDIO_LANGS):
+                      reason = "untagged/und" if not lang_tokens else f"disallowed language '{lang_raw}'"
+                      audio_drop.append((s, reason))
+                  else:
+                      audio_keep.append(s)
+
+              elif ctype == "subtitle":
+                  if not (lang_tokens & ALLOWED_SUB_LANGS):
+                      reason = "untagged/und" if not lang_tokens else f"non-English '{lang_raw}'"
+                      sub_drop.append((s, reason))
+                  elif cname not in ALLOWED_TEXT_SUB_CODECS:
+                      sub_drop.append((s, f"non-text/bitmap subtitle codec '{cname}'"))
+                  else:
+                      sub_keep.append(s)
+
+              else:
+                  # Attachments (fonts) and data streams
+                  other_drop.append((s, f"stream type '{ctype}' ({cname})"))
+
+          # Safety fallback if all video streams were flagged attached_pic
+          if not video_keep and video_drop:
+              video_keep.append(video_drop.pop(0)[0])
+
+          # Zero-match audio fallback: keep default/first audio track so output is never mute
+          if not audio_keep and audio_all:
+              non_comm = [s for s in audio_all if not is_commentary_audio(s, get_tags(s))]
+              pool = non_comm if non_comm else audio_all
+              fallback_track = next(
+                  (s for s in pool if (s.get("disposition") or {}).get("default", 0) == 1),
+                  pool[0]
+              )
+              audio_keep.append(fallback_track)
+              audio_drop = [(s, r) for s, r in audio_drop if s.get("index") != fallback_track.get("index")]
+              print(f"⚠️ Zero audio tracks matched the 7 allowed languages; falling back to stream #{fallback_track.get('index')} so output isn't mute.")
+
+          # Log stream decisions
+          print(f"📊 Stream Audit: Video Keep={len(video_keep)} Drop={len(video_drop)} | "
+                f"Audio Keep={len(audio_keep)} Drop={len(audio_drop)} | "
+                f"Sub Keep={len(sub_keep)} Drop={len(sub_drop)} | "
+                f"Attachments/Other Drop={len(other_drop)} | Chapters Drop={len(chapters)}")
+
+          for s in audio_keep:
+              t = get_tags(s)
+              print(f"  ✅ KEEP AUDIO #{s.get('index')}: codec={s.get('codec_name')} lang={t.get('language', 'und')} title={t.get('title', '-')}")
+          for s, reason in audio_drop:
+              t = get_tags(s)
+              print(f"  🗑️ DROP AUDIO #{s.get('index')}: codec={s.get('codec_name')} lang={t.get('language', 'und')} title={t.get('title', '-')} -> {reason}")
+          for s in sub_keep:
+              t = get_tags(s)
+              print(f"  ✅ KEEP SUB   #{s.get('index')}: codec={s.get('codec_name')} lang={t.get('language', 'und')} title={t.get('title', '-')}")
+          for s, reason in sub_drop:
+              t = get_tags(s)
+              print(f"  🗑️ DROP SUB   #{s.get('index')}: codec={s.get('codec_name')} lang={t.get('language', 'und')} title={t.get('title', '-')} -> {reason}")
+
+          total_dropped_items = len(video_drop) + len(audio_drop) + len(sub_drop) + len(other_drop) + len(chapters)
+          if total_dropped_items == 0:
+              print("✨ File is already completely clean (no bloat tracks, chapters, or attachments). Skipping remux!")
+              sys.exit(0)
+
+          # 3. Build stream-copy ffmpeg command
+          ext = os.path.splitext(target_file)[1].lower()
+          if ext not in {".mkv", ".mp4"}:
+              ext = ".mkv"
+          temp_output = os.path.join(os.path.dirname(target_file), f".lean_remux_tmp{ext}")
+
+          cmd = [
+              "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+              "-i", target_file,
+              "-map_chapters", "-1",
+              "-dn",
+          ]
+
+          for s in video_keep:
+              cmd += ["-map", f"0:{s['index']}"]
+          for s in audio_keep:
+              cmd += ["-map", f"0:{s['index']}"]
+          for s in sub_keep:
+              cmd += ["-map", f"0:{s['index']}"]
+
+          if ext == ".mp4":
+              cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"]
+          else:
+              cmd += ["-c", "copy"]
+
+          if audio_keep and not any((s.get("disposition") or {}).get("default", 0) == 1 for s in audio_keep):
+              cmd += ["-disposition:a:0", "default"]
+
+          cmd += ["-max_muxing_queue_size", "9999", temp_output]
+
+          # 4. Execute ffmpeg with adaptive in-place sparse hole-punching when disk headroom is tight
+          FALLOC_FL_KEEP_SIZE = 0x01
+          FALLOC_FL_PUNCH_HOLE = 0x02
+          PUNCH_MODE = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
+
+          MB = 1024 * 1024
+          GB = 1024 * MB
+          HEADER_KEEP = 128 * MB
+          FOOTER_KEEP = 128 * MB
+          SAFETY_LAG = 2 * GB
+          MIN_PUNCH_STEP = 256 * MB
+
+          use_hole_punch = free_before < (orig_size + 10 * GB)
+          print(f"🚀 Starting stream-copy remux (Live Sparse Hole-Punching: {'ENABLED' if use_hole_punch else 'DISABLED - ample free space'})...")
+
+          t0 = time.perf_counter()
+          proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+
+          punch_fd = None
+          punched_up_to = HEADER_KEEP
+          total_punched = 0
+          recent_positions = deque(maxlen=100)  # 100 samples @ 20ms = 2.0s rolling window
+
+          if use_hole_punch and hasattr(os, "fallocate") and orig_size > (HEADER_KEEP + FOOTER_KEEP + SAFETY_LAG):
+              try:
+                  punch_fd = os.open(target_file, os.O_RDWR)
+              except OSError as e:
+                  print(f"⚠️ Could not open input for hole-punching ({e}); proceeding with standard remux.")
+                  punch_fd = None
+
+          def get_ffmpeg_min_read_pos(pid: int, target_abs: str):
+              fd_dir = f"/proc/{pid}/fd"
+              fdinfo_dir = f"/proc/{pid}/fdinfo"
+              positions = []
+              try:
+                  for fd_name in os.listdir(fd_dir):
+                      try:
+                          link_target = os.readlink(f"{fd_dir}/{fd_name}")
+                          if link_target == target_abs:
+                              with open(f"{fdinfo_dir}/{fd_name}", "r") as f:
+                                  for line in f:
+                                      if line.startswith("pos:"):
+                                          positions.append(int(line.split()[1]))
+                                          break
+                      except OSError:
+                          continue
+              except OSError:
+                  pass
+              return min(positions) if positions else None
+
+          try:
+              while proc.poll() is None:
+                  if punch_fd is not None:
+                      # Wait until temp_output has passed initial header probing (>= 64 MiB written)
+                      try:
+                          out_sz = os.path.getsize(temp_output) if os.path.exists(temp_output) else 0
+                      except OSError:
+                          out_sz = 0
+
+                      if out_sz >= 64 * MB:
+                          cur_pos = get_ffmpeg_min_read_pos(proc.pid, target_file)
+                          if cur_pos is not None and cur_pos >= HEADER_KEEP:
+                              recent_positions.append(cur_pos)
+                              if len(recent_positions) == recent_positions.maxlen:
+                                  safe_read_pos = min(recent_positions)
+                                  raw_limit = min(orig_size - FOOTER_KEEP, safe_read_pos - SAFETY_LAG)
+                                  aligned_limit = (raw_limit // MB) * MB
+                                  if aligned_limit - punched_up_to >= MIN_PUNCH_STEP:
+                                      punch_len = aligned_limit - punched_up_to
+                                      try:
+                                          os.fallocate(punch_fd, PUNCH_MODE, punched_up_to, punch_len)
+                                          total_punched += punch_len
+                                          punched_up_to = aligned_limit
+                                      except OSError:
+                                          # Disable further attempts if filesystem does not support punch_hole
+                                          os.close(punch_fd)
+                                          punch_fd = None
+                  time.sleep(0.02)
+          finally:
+              if punch_fd is not None:
+                  try:
+                      os.close(punch_fd)
+                  except OSError:
+                      pass
+
+          _, stderr_out = proc.communicate()
+          elapsed = max(0.001, time.perf_counter() - t0)
+
+          if proc.returncode != 0 or not os.path.exists(temp_output) or os.path.getsize(temp_output) == 0:
+              print(f"❌ ffmpeg remux failed (exit {proc.returncode}):\n{stderr_out}")
+              if os.path.exists(temp_output):
+                  os.remove(temp_output)
+              if total_punched > 0:
+                  print("❌ Input file had sparse blocks deallocated before failure; aborting workflow.")
+                  sys.exit(1)
+              print("⚠️ Continuing with original unstripped file.")
+              sys.exit(0)
+
+          new_size = os.path.getsize(temp_output)
+          os.replace(temp_output, target_file)
+          saved_gib = (orig_size - new_size) / (1024**3)
+          speed_mibs = (new_size / MB) / elapsed
+
+          print(
+              f"✅ Remux complete in {elapsed:.1f}s ({speed_mibs:.1f} MiB/s) | "
+              f"Size: {orig_size / (1024**3):.2f} GiB -> {new_size / (1024**3):.2f} GiB "
+              f"(Stripped {saved_gib:.2f} GiB of bloat, In-Flight Hole-Punched: {total_punched / (1024**3):.2f} GiB)"
+          )
+          EOF_BLOAT
+
+          python3 strip_bloat.py
+          rm -f strip_bloat.py
+
+      - name: Sequential Stream, Chunk, and Upload to 
+        if: env.found == 'true'
+        env:
+          BG_API_ID: ${{ secrets.BG_API_ID }}
+          BG_API_HASH: ${{ secrets.BG_API_HASH }}
+          BG_BOT_TOKEN: ${{ secrets.BG_BOT_TOKEN }}
+          BG_CHAT_ID: ${{ secrets.BG_CHAT_ID }}
+        run: |
+          # 1. Kernel TCP/BBR network stack tuning for multi-gigabit egress
+          sudo sysctl -w net.core.rmem_max=134217728 >/dev/null 2>&1 || true
+          sudo sysctl -w net.core.wmem_max=134217728 >/dev/null 2>&1 || true
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 87380 134217728" >/dev/null 2>&1 || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+
+          # Ensure uvloop is present for C-level libuv socket scheduling
+          python3 -c "import uvloop" 2>/dev/null || pip install -q --break-system-packages uvloop
+
+          cat << 'EOF_PY' > upload_processor.py
+          import os
+          import sys
+          import math
+          import time
+          import random
+          import asyncio
+          import uvloop
+          from pyrogram import Client, raw
+          from pyrogram.session import Session
+          from pyrogram.errors import FloodWait
+
+          uvloop.install()
+
+          API_ID = int(os.environ['BG_API_ID'])
+          API_HASH = os.environ['BG_API_HASH']
+          CHAT_ID = int(os.environ['BG_CHAT_ID'])
+
+          # Parse comma-separated bot tokens dynamically
+          BOT_TOKENS = [t.strip() for t in os.environ.get('BG_BOT_TOKEN', '').split(',') if t.strip()]
+          if not BOT_TOKENS:
+              print("❌ No bot tokens found in BG_BOT_TOKEN.")
+              sys.exit(1)
+
+          print(f"🤖 Detected {len(BOT_TOKENS)} bot token(s) in current execution run.")
+
+          # Locate target payload
+          workspace_dir = 'workspace'
+          all_files = [
+              os.path.join(root, f)
+              for root, _, files in os.walk(workspace_dir)
+              for f in files
+          ]
+          if not all_files:
+              print("❌ No files found in workspace.")
+              sys.exit(1)
+
+          target_file = max(all_files, key=os.path.getsize)
+          file_size = os.path.getsize(target_file)
+          base_filename = os.path.basename(target_file)
+
+          # MTProto maximum geometry: 3990 parts * 512 KiB = 1995.0 MiB per chunk
+          PART_SIZE = 512 * 1024
+          PARTS_PER_CHUNK = 3990
+          CHUNK_SIZE = PARTS_PER_CHUNK * PART_SIZE
+          total_chunks = math.ceil(file_size / CHUNK_SIZE)
+
+          # Anti-throttling & anti-head-of-line-blocking concurrency geometry:
+          # 8 TCP Media Sessions per bot, strictly capped at 3 in-flight 512 KiB parts per socket (24 workers/bot)
+          active_bot_count = min(len(BOT_TOKENS), total_chunks)
+          SESSIONS_PER_BOT = 8
+          MAX_INFLIGHT_PER_SOCKET = 3
+          WORKERS_PER_BOT = SESSIONS_PER_BOT * MAX_INFLIGHT_PER_SOCKET
+          RPC_HARD_TIMEOUT = 12.0
+
+          print(f"🎬 Target: {base_filename} | Size: {file_size / (1024**3):.2f} GiB | Chunks: {total_chunks} (1995 MiB max)")
+          print(f"⚡ Swarm Config: {active_bot_count} Active Bot(s) × {SESSIONS_PER_BOT} Sockets/Bot × {MAX_INFLIGHT_PER_SOCKET} In-Flight/Socket = {active_bot_count * WORKERS_PER_BOT} Parallel Streams")
+
+          # Open single read-only file descriptor for lockless os.pread()
+          fd = os.open(target_file, os.O_RDONLY)
+          if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
+              os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
+
+
+          class BotSwarmNode:
+              def __init__(self, idx: int, token: str):
+                  self.idx = idx
+                  self.token = token
+                  # sleep_threshold=0 forces FloodWait to bubble up immediately instead of blocking inside Pyrofork
+                  self.client = Client(
+                      name=f"swarm_bot_{idx}",
+                      api_id=API_ID,
+                      api_hash=API_HASH,
+                      bot_token=token,
+                      in_memory=True,
+                      no_updates=True,
+                      sleep_threshold=0
+                  )
+                  self.dc_id = None
+                  self.auth_key = None
+                  self.test_mode = None
+                  self.peer = None
+
+                  self.media_sessions = [None] * SESSIONS_PER_BOT
+                  self.slot_locks = [asyncio.Lock() for _ in range(SESSIONS_PER_BOT)]
+                  self.slot_sems = [asyncio.Semaphore(MAX_INFLIGHT_PER_SOCKET) for _ in range(SESSIONS_PER_BOT)]
+                  self.slot_gens = [0] * SESSIONS_PER_BOT
+                  self.cooldown_until = 0.0
+
+              async def _create_media_session(self) -> Session:
+                  while True:
+                      s = Session(
+                          self.client,
+                          self.dc_id,
+                          self.auth_key,
+                          self.test_mode,
+                          is_media=True
+                      )
+                      try:
+                          await asyncio.wait_for(s.start(), timeout=15.0)
+                          return s
+                      except Exception:
+                          asyncio.create_task(self._safe_discard(s))
+                          await asyncio.sleep(1.0)
+
+              async def _safe_discard(self, old_session: Session):
+                  if old_session is None:
+                      return
+                  try:
+                      await asyncio.wait_for(old_session.stop(), timeout=3.0)
+                  except Exception:
+                      pass
+
+              async def start(self):
+                  await self.client.start()
+                  self.peer = await self.client.resolve_peer(CHAT_ID)
+                  self.dc_id = await self.client.storage.dc_id()
+                  self.auth_key = await self.client.storage.auth_key()
+                  self.test_mode = await self.client.storage.test_mode()
+
+                  created = await asyncio.gather(*(self._create_media_session() for _ in range(SESSIONS_PER_BOT)))
+                  for i, s in enumerate(created):
+                      self.media_sessions[i] = s
+
+              async def heal_slot(self, slot_idx: int, failed_gen: int):
+                  # Lock-guarded generation check: if another worker already replaced this slot, return immediately
+                  async with self.slot_locks[slot_idx]:
+                      if self.slot_gens[slot_idx] != failed_gen:
+                          return
+                      old_sess = self.media_sessions[slot_idx]
+                      new_sess = await self._create_media_session()
+                      self.media_sessions[slot_idx] = new_sess
+                      self.slot_gens[slot_idx] += 1
+                      asyncio.create_task(self._safe_discard(old_sess))
+
+              def register_floodwait(self, wait_seconds: float):
+                  target_wakeup = time.monotonic() + wait_seconds + 0.3
+                  if target_wakeup > self.cooldown_until:
+                      self.cooldown_until = target_wakeup
+
+              async def wait_if_cooling_down(self):
+                  while True:
+                      rem = self.cooldown_until - time.monotonic()
+                      if rem <= 0:
+                          return
+                      # Jitter wakeup slightly so all 24 workers don't slam the DC on the exact same millisecond
+                      await asyncio.sleep(rem + random.uniform(0.02, 0.25))
+
+              async def push_part(self, preferred_slot: int, file_id: int, part_idx: int, total_parts: int, offset: int, size: int):
+                  payload = os.pread(fd, size, offset)
+                  query = raw.functions.upload.SaveBigFilePart(
+                      file_id=file_id,
+                      file_part=part_idx,
+                      file_total_parts=total_parts,
+                      bytes=payload
+                  )
+                  attempt = 0
+                  while True:
+                      await self.wait_if_cooling_down()
+                      slot = (preferred_slot + attempt) % SESSIONS_PER_BOT
+
+                      async with self.slot_sems[slot]:
+                          await self.wait_if_cooling_down()
+                          sess = self.media_sessions[slot]
+                          gen = self.slot_gens[slot]
+                          try:
+                              # retries=0 & sleep_threshold=0 disable Pyrofork's buggy internal Session.restart()
+                              # wait_for guarantees a dead socket can never hang forever on is_connected.wait()
+                              await asyncio.wait_for(
+                                  sess.invoke(query, retries=0, timeout=RPC_HARD_TIMEOUT, sleep_threshold=0),
+                                  timeout=RPC_HARD_TIMEOUT + 2.0
+                              )
+                              return
+                          except FloodWait as e:
+                              self.register_floodwait(e.value)
+                          except Exception:
+                              attempt += 1
+                              await self.heal_slot(slot, gen)
+                              await asyncio.sleep(min(0.2 * attempt, 1.5))
+
+              async def stop(self):
+                  await asyncio.gather(*(self._safe_discard(s) for s in self.media_sessions), return_exceptions=True)
+                  try:
+                      await asyncio.wait_for(self.client.stop(), timeout=5.0)
+                  except Exception:
+                      pass
+
+
+          async def upload_chunk_on_node(node: BotSwarmNode, chunk_idx: int):
+              t0 = time.perf_counter()
+              chunk_filename = f"{base_filename}.{chunk_idx:03d}"
+              chunk_offset = (chunk_idx - 1) * CHUNK_SIZE
+              this_chunk_size = min(CHUNK_SIZE, file_size - chunk_offset)
+              total_parts = math.ceil(this_chunk_size / PART_SIZE)
+              file_id = random.getrandbits(63)
+
+              print(f"🚀 [Bot #{node.idx + 1}] Pre-uploading Part {chunk_idx}/{total_chunks} ({this_chunk_size / (1024**2):.1f} MiB, {total_parts} parts)...")
+
+              part_cursor = 0
+
+              async def worker(worker_id: int):
+                  nonlocal part_cursor
+                  preferred_slot = worker_id % SESSIONS_PER_BOT
+                  while True:
+                      p_idx = part_cursor
+                      if p_idx >= total_parts:
+                          return
+                      part_cursor += 1
+                      p_offset = chunk_offset + (p_idx * PART_SIZE)
+                      p_size = min(PART_SIZE, (chunk_offset + this_chunk_size) - p_offset)
+                      await node.push_part(
+                          preferred_slot,
+                          file_id,
+                          p_idx,
+                          total_parts,
+                          p_offset,
+                          p_size
+                      )
+
+              await asyncio.gather(*(worker(w) for w in range(WORKERS_PER_BOT)))
+
+              elapsed = max(0.001, time.perf_counter() - t0)
+              mbps = (this_chunk_size / (1024 * 1024)) / elapsed
+              print(f"⚡ [Bot #{node.idx + 1}] Finished Part {chunk_idx}/{total_chunks} in {elapsed:.1f}s ({mbps:.1f} MiB/s)")
+
+              input_file = raw.types.InputFileBig(
+                  id=file_id,
+                  parts=total_parts,
+                  name=chunk_filename
+              )
+              return node, chunk_filename, input_file
+
+
+          async def main():
+              global_start = time.perf_counter()
+
+              nodes = [BotSwarmNode(i, BOT_TOKENS[i]) for i in range(active_bot_count)]
+              await asyncio.gather(*(n.start() for n in nodes))
+
+              loop = asyncio.get_running_loop()
+              chunk_futures = [loop.create_future() for _ in range(total_chunks)]
+              chunk_queue = asyncio.Queue()
+              for c_idx in range(1, total_chunks + 1):
+                  chunk_queue.put_nowait(c_idx)
+
+              async def bot_worker_loop(node: BotSwarmNode):
+                  while not chunk_queue.empty():
+                      try:
+                          c_idx = chunk_queue.get_nowait()
+                      except asyncio.QueueEmpty:
+                          return
+                      try:
+                          res = await upload_chunk_on_node(node, c_idx)
+                          chunk_futures[c_idx - 1].set_result(res)
+                      except Exception as exc:
+                          if not chunk_futures[c_idx - 1].done():
+                              chunk_futures[c_idx - 1].set_exception(exc)
+                          raise
+
+              async def sequential_committer():
+                  for c_idx in range(1, total_chunks + 1):
+                      node, chunk_filename, input_file = await chunk_futures[c_idx - 1]
+                      while True:
+                          await node.wait_if_cooling_down()
+                          try:
+                              await asyncio.wait_for(
+                                  node.client.invoke(
+                                      raw.functions.messages.SendMedia(
+                                          peer=node.peer,
+                                          media=raw.types.InputMediaUploadedDocument(
+                                              file=input_file,
+                                              mime_type="application/octet-stream",
+                                              attributes=[raw.types.DocumentAttributeFilename(file_name=chunk_filename)],
+                                              force_file=True
+                                          ),
+                                          message=chunk_filename,
+                                          random_id=node.client.rnd_id()
+                                      ),
+                                      retries=0,
+                                      timeout=15.0,
+                                      sleep_threshold=0
+                                  ),
+                                  timeout=18.0
+                              )
+                              print(f"✅ [Committed {c_idx}/{total_chunks}] {chunk_filename} (via Bot #{node.idx + 1})")
+                              break
+                          except FloodWait as e:
+                              node.register_floodwait(e.value)
+                          except Exception:
+                              await asyncio.sleep(1.5)
+
+              await asyncio.gather(
+                  sequential_committer(),
+                  *(bot_worker_loop(n) for n in nodes)
+              )
+
+              os.close(fd)
+              await asyncio.gather(*(n.stop() for n in nodes))
+
+              total_elapsed = max(0.001, time.perf_counter() - global_start)
+              agg_speed = (file_size / (1024 * 1024)) / total_elapsed
+              print(f"\n🎉 All {total_chunks} chunks uploaded & committed in {total_elapsed:.1f}s (Effective: {agg_speed:.1f} MiB/s)!")
+
+          asyncio.run(main())
+          EOF_PY
+
+          python3 upload_processor.py
+          rm -rf workspace/
