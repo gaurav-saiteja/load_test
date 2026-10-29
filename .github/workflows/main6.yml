@@ -66,8 +66,9 @@ jobs:
 
           # Link shared libraries, start Cloudflare WARP daemon, and expose Python path
           sudo ldconfig
+          sudo mkdir -p /var/lib/cloudflare-warp /run/cloudflare-warp
           sudo systemctl daemon-reload
-          sudo systemctl start warp-svc || (sudo nohup warp-svc >/dev/null 2>&1 &)
+          sudo systemctl start warp-svc || sudo env RUNNER_TRACKING_ID="" bash -c 'nohup warp-svc >/dev/null 2>&1 &'
           echo "PYTHONPATH=/opt/fastdeps/pydeps" >> $GITHUB_ENV
           
           T_END=$(date +%s%3N)
@@ -88,7 +89,17 @@ jobs:
           mkdir -p workspace
           echo "Evaluating Payload Type..."
 
-          warp-cli --accept-tos registration new
+          # Ensure warp-svc is running and wait for its IPC socket before invoking warp-cli
+          if ! pgrep -x "warp-svc" >/dev/null 2>&1; then
+            sudo mkdir -p /var/lib/cloudflare-warp /run/cloudflare-warp
+            sudo systemctl start warp-svc || (sudo nohup warp-svc >/dev/null 2>&1 &)
+          fi
+          for i in {1..30}; do
+            if warp-cli --accept-tos status >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          warp-cli --accept-tos registration new >/dev/null 2>&1 || true
           warp-cli --accept-tos mode proxy
           warp-cli --accept-tos connect
 
