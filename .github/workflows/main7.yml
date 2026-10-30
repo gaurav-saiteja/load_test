@@ -319,6 +319,8 @@ jobs:
               "ko", "kor", "korean",
               # Japanese
               "ja", "jpn", "japanese",
+              # Thai
+              "thai", "tha"
           }
 
           ALLOWED_SUB_LANGS = {"en", "eng", "english"}
