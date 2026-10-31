@@ -767,7 +767,9 @@ jobs:
                               stem, ext = os.path.splitext(base_name)
                               out_path = os.path.join(WORKSPACE_DIR, f"{stem}_{idx}{ext}")
 
-                          punched_up_to = (zinfo.header_offset // MB) * MB
+                          # Round UP to the next 1 MiB boundary so we never touch bytes belonging to the previous episode
+                          start_aligned = ((zinfo.header_offset + MB - 1) // MB) * MB
+                          punched_up_to = start_aligned
 
                           with zf.open(zinfo, "r") as src, open(out_path, "wb") as dst:
                               shared_f = getattr(src, "_fileobj", None)
@@ -787,10 +789,10 @@ jobs:
                                       except Exception:
                                           pass
 
-                          # All bytes from zinfo.header_offset to EOF have now been extracted; truncate tail immediately
+                          # Truncate at the 1 MiB-aligned ceiling so the preceding episode's tail page is untouched
                           if punch_fd is not None:
                               try:
-                                  os.ftruncate(punch_fd, zinfo.header_offset)
+                                  os.ftruncate(punch_fd, start_aligned)
                               except OSError:
                                   pass
 
