@@ -292,7 +292,7 @@ jobs:
                       payload_name = url_path
 
                   def probe_http(proxies=None):
-                      nonlocal total_bytes, payload_name, is_archive
+                      global total_bytes, payload_name, is_archive
                       # Fast HEAD request first
                       h_resp = requests.head(link, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True, timeout=6, proxies=proxies)
                       headers_used = h_resp.headers
