@@ -342,7 +342,7 @@ jobs:
           else:
               size_gib = total_bytes / GIB
               size_str = f"{size_gib:.2f} GiB"
-              threshold_gib = 40.0 if is_archive else 80.0
+              threshold_gib = 60.0 if is_archive else 80.0
               need_free_space = "true" if size_gib >= threshold_gib else "false"
 
           print(
