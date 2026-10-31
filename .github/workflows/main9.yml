@@ -535,15 +535,22 @@ jobs:
                   url
               ]
               ret = subprocess.run(cmd)
-              if ret.returncode != 0:
-                  print(f"⚠️ aria2c returned {ret.returncode}, falling back to direct stream...")
-                  headers = {"Authorization": f"Bearer {creds.token}"}
-                  with requests.get(url, headers=headers, stream=True) as r:
-                      r.raise_for_status()
-                      with open(os.path.join("workspace", fname), "wb") as out_f:
-                          for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
-                              if chunk:
-                                  out_f.write(chunk)
+              if ret.returncode != 0:              
+                print(f"⚠️ aria2c returned {ret.returncode}, falling back to direct stream...")
+                headers = {"Authorization": f"Bearer {creds.token}"}
+                with requests.get(url, headers=headers, stream=True) as r:
+                    try:
+                        r.raise_for_status()
+                    except requests.exceptions.HTTPError as e:
+                        print("\n❌ GOOGLE API ERROR RESPONSE:")
+                        print(r.text)
+                        print("-" * 40)
+                        raise
+                    
+                    with open(os.path.join("workspace", fname), "wb") as out_f:
+                        for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
+                            if chunk:
+                                out_f.write(chunk)
               elapsed = max(0.001, time.perf_counter() - t0)
               actual_sz = os.path.getsize(os.path.join("workspace", fname)) / (1024 ** 2)
               print(f"✅ Finished '{fname}' in {elapsed:.1f}s ({actual_sz / elapsed:.1f} MiB/s)")
