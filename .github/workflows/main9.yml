@@ -32,7 +32,7 @@ jobs:
         with:
           path: /tmp/stage_root
           # Bumped to v2 to cache aria2c, yt-dlp, qbittorrent-nox, unrar, cloudflare-warp, and pydeps
-          key: ${{ runner.os }}-deps-v2
+          key: ${{ runner.os }}-deps-v3
 
       - name: Install Dependencies & Tune Kernel Network Stack
         run: |
@@ -62,7 +62,7 @@ jobs:
             mkdir -p /tmp/debs /tmp/stage_root/opt/fastdeps/pydeps /tmp/stage_root/usr/local/bin
 
             # Download .deb packages (aria2, unrar, cloudflare-warp) and all their shared libraries
-            sudo apt-get install -y --download-only -o Dir::Cache::archives="/tmp/debs" aria2 unrar cloudflare-warp
+            sudo apt-get install -y --download-only -o Dir::Cache::archives="/tmp/debs" aria2 unrar cloudflare-warp ffmpeg
             for deb in /tmp/debs/*.deb; do
               dpkg-deb -x "$deb" /tmp/stage_root
             done
