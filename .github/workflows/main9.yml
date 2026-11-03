@@ -32,7 +32,7 @@ jobs:
         with:
           path: /tmp/stage_root
           # Bumped to v2 to cache aria2c, yt-dlp, qbittorrent-nox, unrar, cloudflare-warp, and pydeps
-          key: ${{ runner.os }}-deps-v4
+          key: ${{ runner.os }}-deps-v5
 
       - name: Install Dependencies & Tune Kernel Network Stack
         run: |
@@ -48,7 +48,8 @@ jobs:
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
 
           # 2. Restore or build cached binary & Python dependencies
-          if [ -d "/tmp/stage_root/opt/fastdeps/pydeps" ] && [ -x "/tmp/stage_root/usr/local/bin/yt-dlp" ]; then
+          # 2. Restore or build cached binary & Python dependencies
+          if [ -d "/tmp/stage_root/opt/fastdeps/pydeps" ] && [ -x "/tmp/stage_root/usr/local/bin/yt-dlp" ] && PYTHONPATH="/tmp/stage_root/opt/fastdeps/pydeps" /usr/bin/python3 -c "import uvloop.loop, tgcrypto" >/dev/null 2>&1; then
             echo "⚡ Cache HIT! Deploying pre-built binaries and Python dependencies..."
             sudo tar -cf - -C /tmp/stage_root . | sudo tar --keep-directory-symlink -xf - -C /
             # Reclaim /tmp/stage_root immediately on cache hit since actions/cache skips post-save on hits
@@ -90,7 +91,8 @@ jobs:
             rm -rf /tmp/stage_root/usr/share/doc /tmp/stage_root/usr/share/man /tmp/stage_root/usr/share/locale
 
             # Pre-install Python packages into cached target directory
-            pip install -U --break-system-packages --target=/tmp/stage_root/opt/fastdeps/pydeps \
+            /usr/bin/python3 -m pip --version >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends python3-pip
+            /usr/bin/python3 -m pip install -U --break-system-packages --target=/tmp/stage_root/opt/fastdeps/pydeps \
               pyrofork tgcrypto requests google-auth tqdm uvloop
             find /tmp/stage_root/opt/fastdeps/pydeps -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
@@ -366,7 +368,7 @@ jobs:
           write_env("NEED_FREE_SPACE", need_free_space)
           EOF_ASSESS
 
-          python3 -u assess_payload.py
+          /usr/bin/python3 -u assess_payload.py
           rm -f assess_payload.py
 
       - name: Free Up Disk Space (Ultra-Fast Parallel)
@@ -436,137 +438,286 @@ jobs:
           # -------------------------------------------------------------------------
           # PATH 1: GOOGLE DRIVE (16-Connection Parallel Range Slicing via aria2c)
           # -------------------------------------------------------------------------
-          if [[ "$PAYLOAD_TYPE" == "gdrive_direct" ]]; then
-            echo "🚀 Downloading confirmed Google Drive link via 16-stream aria2c..."
-            aria2c -x 8 -s 8 -k 8M \
-              --file-allocation=falloc \
-              --disk-cache=128M \
-              --stream-piece-selector=geom \
-              --continue=true \
-              --max-tries=10 \
-              --retry-wait=2 \
-              --console-log-level=warn \
-              --summary-interval=5 \
-              --header="User-Agent: Mozilla/5.0" \
-              -d workspace "$TARGET_LINK" || (cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..)
-
-          elif [[ "$PAYLOAD_TYPE" == "gdrive_sa" ]]; then
-            cat << 'EOF_GDRIVE' > gdrive_sa_dl.py
+          if [[ "$PAYLOAD_TYPE" == "gdrive_direct" ]] || [[ "$PAYLOAD_TYPE" == "gdrive_sa" ]]; then
+            cat << 'EOF_GDRIVE' > gdrive_fast_dl.py
           import os
           import sys
           import re
           import json
           import time
-          import subprocess
+          import queue
+          import ctypes
+          import socket
+          import threading
+          import urllib.parse
           import requests
-          from google.oauth2 import service_account
-          from google.auth.transport.requests import Request
+          from requests.adapters import HTTPAdapter
+          from urllib3.connection import HTTPConnection
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
           sys.stdout.reconfigure(line_buffering=True)
           sys.stderr.reconfigure(line_buffering=True)
 
           link = sys.argv[1]
+          payload_type = os.environ.get("PAYLOAD_TYPE", "gdrive_sa")
+          server_filename = os.environ.get("SERVER_FILENAME", "Drive_Payload.mkv")
           sa_json_str = os.environ.get("GCP_SA_JSON", "")
-          if not sa_json_str:
-              print("❌ Missing GCP_SA_JSON secret.")
-              sys.exit(1)
 
-          sa_info = json.loads(sa_json_str)
-          creds = service_account.Credentials.from_service_account_info(
-              sa_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-          )
+          MB = 1024 * 1024
+          GB = 1024 * MB
+          SLAB_SIZE = 16 * MB
+          NUM_SLABS = 3
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-          # Load pre-flight manifest if available to skip duplicate API calls
-          files_to_download = []
-          if os.path.exists("/tmp/gdrive_manifest.json"):
-              with open("/tmp/gdrive_manifest.json", "r", encoding="utf-8") as mf:
-                  cached = json.load(mf)
-                  creds.token = cached.get("token")
-                  files_to_download = cached.get("files", [])
+          # Bind libc fallocate64 for instant zero-stall ext4 extent pre-allocation
+          try:
+              _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+              _fallocate64 = getattr(_libc, "fallocate64", getattr(_libc, "fallocate"))
+              _fallocate64.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
+              _fallocate64.restype = ctypes.c_int
 
-          if not creds.token or not files_to_download:
-              creds.refresh(Request())
-              headers = {"Authorization": f"Bearer {creds.token}"}
-              match = re.search(r"(id=|/d/|folders/)([a-zA-Z0-9_-]+)", link)
-              file_id = match.group(2)
+              def preallocate_file(fd: int, size: int):
+                  if size > 0:
+                      _fallocate64(fd, 0, 0, size)
+          except Exception:
+              def preallocate_file(fd: int, size: int):
+                  pass
 
-              def walk(fid):
-                  res = requests.get(
-                      f"https://www.googleapis.com/drive/v3/files/{fid}?fields=id,name,mimeType,size&supportsAllDrives=true",
-                      headers=headers
-                  ).json()
-                  if res.get("mimeType") == "application/vnd.google-apps.folder":
-                      children = requests.get(
-                          f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false"
-                          f"&fields=files(id,name,mimeType,size)&pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true",
-                          headers=headers
-                      ).json().get("files", [])
-                      for c in children:
-                          walk(c["id"])
-                  else:
-                      files_to_download.append({
-                          "id": fid,
-                          "name": res["name"],
-                          "size": int(res.get("size", 0))
-                      })
+          # Tune underlying urllib3 sockets for 16 MiB SO_RCVBUF and TCP_NODELAY
+          class HighSpeedDriveAdapter(HTTPAdapter):
+              def init_poolmanager(self, *args, **kwargs):
+                  kwargs["socket_options"] = HTTPConnection.default_socket_options + [
+                      (socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * MB),
+                      (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                  ]
+                  super().init_poolmanager(*args, **kwargs)
 
-              walk(file_id)
+          def build_session() -> requests.Session:
+              s = requests.Session()
+              adapter = HighSpeedDriveAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+              s.mount("https://", adapter)
+              s.mount("http://", adapter)
+              return s
 
-          last_refresh = time.monotonic()
+          def stream_to_disk_zero_copy(session: requests.Session, url: str, base_headers: dict, out_path: str, expected_size: int):
+              fd = os.open(out_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+              preallocated = False
+              if expected_size > 0:
+                  preallocate_file(fd, expected_size)
+                  preallocated = True
 
-          for idx, fmeta in enumerate(files_to_download, 1):
-              if time.monotonic() - last_refresh > 1800:
-                  creds.refresh(Request())
-                  last_refresh = time.monotonic()
+              written = 0
+              max_attempts = 6
 
-              fid = fmeta["id"]
-              fname = fmeta["name"]
-              fsize_gib = fmeta.get("size", 0) / (1024 ** 3)
-              url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media&acknowledgeAbuse=true"
+              try:
+                  for attempt in range(1, max_attempts + 1):
+                      req_headers = dict(base_headers)
+                      req_headers["User-Agent"] = UA
+                      req_headers["Accept-Encoding"] = "identity"
+                      if written > 0:
+                          req_headers["Range"] = f"bytes={written}-"
 
-              print(f"⚡ [{idx}/{len(files_to_download)}] Downloading '{fname}' ({fsize_gib:.2f} GiB) via 16-stream aria2c...")
+                      try:
+                          with session.get(url, headers=req_headers, stream=True, timeout=(15, 60)) as r:
+                              if r.status_code >= 400:
+                                  print(f"\n❌ GOOGLE API ERROR RESPONSE (HTTP {r.status_code}):\n{r.text}\n" + "-" * 40)
+                                  r.raise_for_status()
+
+                              if not preallocated and written == 0:
+                                  cl = r.headers.get("Content-Length", "")
+                                  if cl.isdigit() and int(cl) > 0:
+                                      expected_size = int(cl)
+                                      preallocate_file(fd, expected_size)
+                                      preallocated = True
+
+                              # Triple-buffered 16 MiB slabs for concurrent socket-read + os.pwrite
+                              slabs = [bytearray(SLAB_SIZE) for _ in range(NUM_SLABS)]
+                              views = [memoryview(b) for b in slabs]
+                              free_q = queue.Queue()
+                              write_q = queue.Queue()
+                              for i in range(NUM_SLABS):
+                                  free_q.put(i)
+
+                              writer_err = []
+
+                              def disk_writer():
+                                  nonlocal written
+                                  while True:
+                                      item = write_q.get()
+                                      if item is None:
+                                          write_q.task_done()
+                                          break
+                                      idx, nbytes = item
+                                      try:
+                                          mv = views[idx][:nbytes]
+                                          off = 0
+                                          while off < nbytes:
+                                              w = os.pwrite(fd, mv[off:], written + off)
+                                              off += w
+                                          written += nbytes
+                                      except Exception as e:
+                                          writer_err.append(e)
+                                      finally:
+                                          free_q.put(idx)
+                                          write_q.task_done()
+
+                              wt = threading.Thread(target=disk_writer, daemon=True)
+                              wt.start()
+
+                              raw_stream = r.raw
+                              try:
+                                  while True:
+                                      if writer_err:
+                                          raise writer_err[0]
+                                      idx = free_q.get()
+                                      mv = views[idx]
+                                      filled = 0
+                                      while filled < SLAB_SIZE:
+                                          n = raw_stream.readinto(mv[filled:])
+                                          if not n:
+                                              break
+                                          filled += n
+                                      if filled > 0:
+                                          write_q.put((idx, filled))
+                                      else:
+                                          free_q.put(idx)
+                                          break
+                              finally:
+                                  write_q.put(None)
+                                  wt.join()
+
+                              if writer_err:
+                                  raise writer_err[0]
+
+                              if expected_size > 0 and written < expected_size:
+                                  raise IOError(f"Premature EOF at {written}/{expected_size} bytes")
+                              break
+
+                      except Exception as e:
+                          if attempt == max_attempts:
+                              raise
+                          wait_s = min(2 ** attempt, 15)
+                          print(f"⚠️ Stream interrupted at {written / MB:.1f} MiB ({e}); resuming in {wait_s}s [{attempt}/{max_attempts}]...")
+                          time.sleep(wait_s)
+
+                  if written > 0:
+                      os.ftruncate(fd, written)
+              finally:
+                  os.close(fd)
+
+              return written
+
+          if payload_type == "gdrive_direct":
+              session = build_session()
+              out_path = os.path.join("workspace", server_filename)
+              print(f"🚀 Downloading confirmed Google Drive link ('{server_filename}') via high-speed single stream...")
               t0 = time.perf_counter()
-              cmd = [
-                  "aria2c",
-                  f"--header=Authorization: Bearer {creds.token}",
-                  "--max-connection-per-server=8",
-                  "--split=8",
-                  "--min-split-size=8M",
-                  "--file-allocation=falloc",
-                  "--disk-cache=128M",
-                  "--stream-piece-selector=geom",
-                  "--continue=true",
-                  "--max-tries=10",
-                  "--retry-wait=2",
-                  "--console-log-level=warn",
-                  "--summary-interval=5",
-                  "-d", "workspace",
-                  "-o", fname,
-                  url
-              ]
-              ret = subprocess.run(cmd)
-              if ret.returncode != 0:              
-                print(f"⚠️ aria2c returned {ret.returncode}, falling back to direct stream...")
-                headers = {"Authorization": f"Bearer {creds.token}"}
-                with requests.get(url, headers=headers, stream=True) as r:
-                    try:
-                        r.raise_for_status()
-                    except requests.exceptions.HTTPError as e:
-                        print("\n❌ GOOGLE API ERROR RESPONSE:")
-                        print(r.text)
-                        print("-" * 40)
-                        raise
-                    
-                    with open(os.path.join("workspace", fname), "wb") as out_f:
-                        for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
-                            if chunk:
-                                out_f.write(chunk)
+              total_written = stream_to_disk_zero_copy(session, link, {}, out_path, 0)
               elapsed = max(0.001, time.perf_counter() - t0)
-              actual_sz = os.path.getsize(os.path.join("workspace", fname)) / (1024 ** 2)
-              print(f"✅ Finished '{fname}' in {elapsed:.1f}s ({actual_sz / elapsed:.1f} MiB/s)")
+              print(f"✅ Finished '{server_filename}' ({total_written / GB:.2f} GiB) in {elapsed:.1f}s ({(total_written / MB) / elapsed:.1f} MiB/s)")
+
+          else:
+              from google.oauth2 import service_account
+              from google.auth.transport.requests import Request
+
+              if not sa_json_str:
+                  print("❌ Missing GCP_SA_JSON secret.")
+                  sys.exit(1)
+
+              sa_info = json.loads(sa_json_str)
+              creds = service_account.Credentials.from_service_account_info(
+                  sa_info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+              )
+
+              files_to_download = []
+              if os.path.exists("/tmp/gdrive_manifest.json"):
+                  with open("/tmp/gdrive_manifest.json", "r", encoding="utf-8") as mf:
+                      cached = json.load(mf)
+                      creds.token = cached.get("token")
+                      files_to_download = cached.get("files", [])
+
+              if not creds.token or not files_to_download:
+                  creds.refresh(Request())
+                  headers = {"Authorization": f"Bearer {creds.token}"}
+                  match = re.search(r"(id=|/d/|folders/)([a-zA-Z0-9_-]+)", link)
+                  file_id = match.group(2)
+
+                  def walk(fid):
+                      res = requests.get(
+                          f"https://www.googleapis.com/drive/v3/files/{fid}?fields=id,name,mimeType,size&supportsAllDrives=true",
+                          headers=headers, timeout=15
+                      ).json()
+                      if res.get("mimeType") == "application/vnd.google-apps.folder":
+                          page_token = None
+                          while True:
+                              q_url = (
+                                  f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false"
+                                  f"&fields=nextPageToken,files(id,name,mimeType,size)&pageSize=1000"
+                                  f"&supportsAllDrives=true&includeItemsFromAllDrives=true"
+                              )
+                              if page_token:
+                                  q_url += f"&pageToken={page_token}"
+                              cres = requests.get(q_url, headers=headers, timeout=15).json()
+                              for c in cres.get("files", []):
+                                  if c.get("mimeType") == "application/vnd.google-apps.folder":
+                                      walk(c["id"])
+                                  else:
+                                      files_to_download.append({
+                                          "id": c["id"],
+                                          "name": c.get("name", c["id"]),
+                                          "size": int(c.get("size", 0))
+                                      })
+                              page_token = cres.get("nextPageToken")
+                              if not page_token:
+                                  break
+                      else:
+                          files_to_download.append({
+                              "id": fid,
+                              "name": res["name"],
+                              "size": int(res.get("size", 0))
+                          })
+
+                  walk(file_id)
+
+              token_lock = threading.Lock()
+              last_refresh = time.monotonic()
+
+              def get_valid_token() -> str:
+                  nonlocal last_refresh
+                  with token_lock:
+                      if not creds.token or (time.monotonic() - last_refresh > 1800):
+                          creds.refresh(Request())
+                          last_refresh = time.monotonic()
+                      return creds.token
+
+              total_files = len(files_to_download)
+              workers = min(2, max(1, total_files))
+
+              def download_one(idx: int, fmeta: dict):
+                  fid = fmeta["id"]
+                  fname = fmeta["name"]
+                  fsize = int(fmeta.get("size", 0))
+                  out_path = os.path.join("workspace", fname)
+                  if os.path.exists(out_path):
+                      stem, ext = os.path.splitext(fname)
+                      out_path = os.path.join("workspace", f"{stem}_{idx}{ext}")
+
+                  url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media&acknowledgeAbuse=true"
+                  print(f"⚡ [{idx}/{total_files}] Downloading '{fname}' ({fsize / GB:.2f} GiB) via zero-copy stream...")
+                  t0 = time.perf_counter()
+                  session = build_session()
+                  headers = {"Authorization": f"Bearer {get_valid_token()}"}
+                  written = stream_to_disk_zero_copy(session, url, headers, out_path, fsize)
+                  elapsed = max(0.001, time.perf_counter() - t0)
+                  print(f"✅ [{idx}/{total_files}] Finished '{fname}' in {elapsed:.1f}s ({(written / MB) / elapsed:.1f} MiB/s)")
+
+              with ThreadPoolExecutor(max_workers=workers) as pool:
+                  futs = [pool.submit(download_one, idx, fmeta) for idx, fmeta in enumerate(files_to_download, 1)]
+                  for fut in as_completed(futs):
+                      fut.result()
           EOF_GDRIVE
-            python3 -u gdrive_sa_dl.py "$TARGET_LINK"
-            rm -f gdrive_sa_dl.py /tmp/gdrive_manifest.json
+            /usr/bin/python3 -u gdrive_fast_dl.py "$TARGET_LINK"
+            rm -f gdrive_fast_dl.py /tmp/gdrive_manifest.json
 
           # -------------------------------------------------------------------------
           # PATH 2: DIRECT HTTP/HTTPS LINKS (Direct-First 16-Stream aria2c + WARP Fallback)
@@ -700,7 +851,7 @@ jobs:
                   time.sleep(2)
           EOF_QBIT
 
-            python3 -u qbit_monitor.py "$TARGET_LINK"
+            /usr/bin/python3 -u qbit_monitor.py "$TARGET_LINK"
             curl -s -X POST http://127.0.0.1:8085/api/v2/app/shutdown || true
             rm -f qbit_monitor.py /tmp/payload.torrent
           fi
@@ -835,7 +986,7 @@ jobs:
               print(f"⚡ Sparse ZIP extraction finished in {elapsed:.1f}s | Free Disk: {free_end / GB:.2f} GiB")
           EOF_UNZIP
 
-          python3 -u sparse_unzip.py
+          /usr/bin/python3 -u sparse_unzip.py
           rm -f sparse_unzip.py
 
           # Extract RAR archives if present
@@ -1232,7 +1383,7 @@ jobs:
               )
           EOF_BLOAT
 
-          python3 -u strip_bloat.py
+          /usr/bin/python3 -u strip_bloat.py
           rm -f strip_bloat.py
 
       - name: Sequential Stream, Chunk, and Upload to
@@ -1251,7 +1402,6 @@ jobs:
           import time
           import random
           import asyncio
-          import uvloop
           from pyrogram import Client, raw
           from pyrogram.session import Session
           from pyrogram.errors import FloodWait
@@ -1260,7 +1410,11 @@ jobs:
           sys.stdout.reconfigure(line_buffering=True)
           sys.stderr.reconfigure(line_buffering=True)
 
-          uvloop.install()
+          try:
+              import uvloop
+              uvloop.install()
+          except ImportError as e:
+              print(f"⚠️ uvloop unavailable ({e}), falling back to default asyncio event loop.")
 
           API_ID = int(os.environ['BG_API_ID'])
           API_HASH = os.environ['BG_API_HASH']
@@ -1632,5 +1786,5 @@ jobs:
           asyncio.run(main())
           EOF_PY
 
-          python3 -u upload_processor.py
+          /usr/bin/python3 -u upload_processor.py
           rm -rf workspace/ upload_processor.py
