@@ -683,7 +683,7 @@ jobs:
               last_refresh = time.monotonic()
 
               def get_valid_token() -> str:
-                  nonlocal last_refresh
+                  global last_refresh
                   with token_lock:
                       if not creds.token or (time.monotonic() - last_refresh > 1800):
                           creds.refresh(Request())
