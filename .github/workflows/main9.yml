@@ -438,7 +438,7 @@ jobs:
           # -------------------------------------------------------------------------
           if [[ "$PAYLOAD_TYPE" == "gdrive_direct" ]]; then
             echo "🚀 Downloading confirmed Google Drive link via 16-stream aria2c..."
-            aria2c -x 16 -s 16 -k 8M \
+            aria2c -x 8 -s 8 -k 8M \
               --file-allocation=falloc \
               --disk-cache=128M \
               --stream-piece-selector=geom \
@@ -529,8 +529,8 @@ jobs:
               cmd = [
                   "aria2c",
                   f"--header=Authorization: Bearer {creds.token}",
-                  "--max-connection-per-server=16",
-                  "--split=16",
+                  "--max-connection-per-server=8",
+                  "--split=8",
                   "--min-split-size=8M",
                   "--file-allocation=falloc",
                   "--disk-cache=128M",
@@ -558,7 +558,7 @@ jobs:
                         raise
                     
                     with open(os.path.join("workspace", fname), "wb") as out_f:
-                        for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
+                        for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
                             if chunk:
                                 out_f.write(chunk)
               elapsed = max(0.001, time.perf_counter() - t0)
