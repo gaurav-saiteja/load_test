@@ -32,7 +32,7 @@ jobs:
         with:
           path: /tmp/stage_root
           # Bumped to v2 to cache aria2c, yt-dlp, qbittorrent-nox, unrar, cloudflare-warp, and pydeps
-          key: ${{ runner.os }}-deps-v5
+          key: ${{ runner.os }}-deps-v6
 
       - name: Install Dependencies & Tune Kernel Network Stack
         run: |
@@ -93,7 +93,7 @@ jobs:
             # Pre-install Python packages into cached target directory
             /usr/bin/python3 -m pip --version >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends python3-pip
             /usr/bin/python3 -m pip install -U --break-system-packages --target=/tmp/stage_root/opt/fastdeps/pydeps \
-              pyrofork tgcrypto requests google-auth tqdm uvloop
+              pyrofork tgcrypto requests[socks] google-auth tqdm uvloop
             find /tmp/stage_root/opt/fastdeps/pydeps -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
             echo "📦 Syncing staged dependencies to root filesystem..."
@@ -439,6 +439,7 @@ jobs:
           # PATH 1: GOOGLE DRIVE (16-Connection Parallel Range Slicing via aria2c)
           # -------------------------------------------------------------------------
           if [[ "$PAYLOAD_TYPE" == "gdrive_direct" ]] || [[ "$PAYLOAD_TYPE" == "gdrive_sa" ]]; then
+          ensure_warp_connected
             cat << 'EOF_GDRIVE' > gdrive_fast_dl.py
           import os
           import sys
@@ -467,7 +468,7 @@ jobs:
           GB = 1024 * MB
           SLAB_SIZE = 16 * MB
           NUM_SLABS = 3
-          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/539.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/539.36"
 
           # Bind libc fallocate64 for instant zero-stall ext4 extent pre-allocation
           try:
@@ -716,8 +717,14 @@ jobs:
                   for fut in as_completed(futs):
                       fut.result()
           EOF_GDRIVE
+            ALL_PROXY="socks5h://127.0.0.1:40000" \
+            HTTP_PROXY="socks5h://127.0.0.1:40000" \
+            HTTPS_PROXY="socks5h://127.0.0.1:40000" \
             /usr/bin/python3 -u gdrive_fast_dl.py "$TARGET_LINK"
             rm -f gdrive_fast_dl.py /tmp/gdrive_manifest.json
+
+            echo "🔌 Disconnecting WARP..."
+            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
 
           # -------------------------------------------------------------------------
           # PATH 2: DIRECT HTTP/HTTPS LINKS (Direct-First 16-Stream aria2c + WARP Fallback)
