@@ -302,17 +302,19 @@ jobs:
                   if url_path:
                       payload_name = url_path
 
+                  ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/539.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/539.36"
+
                   def probe_http(proxies=None):
                       global total_bytes, payload_name, is_archive
-                      h_resp = requests.head(link, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True, timeout=6, proxies=proxies)
+                      h_resp = requests.head(link, headers={"User-Agent": ua}, allow_redirects=True, timeout=8, proxies=proxies)
                       headers_used = h_resp.headers
                       if h_resp.status_code >= 400 or ("Content-Length" not in h_resp.headers and "Content-Disposition" not in h_resp.headers):
                           g_resp = requests.get(
                               link,
-                              headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"},
+                              headers={"User-Agent": ua, "Range": "bytes=0-0"},
                               stream=True,
                               allow_redirects=True,
-                              timeout=6,
+                              timeout=8,
                               proxies=proxies
                           )
                           headers_used = g_resp.headers
@@ -338,9 +340,30 @@ jobs:
                   try:
                       probe_http(proxies=None)
                       use_proxy = "false"
-                  except Exception:
+                  except Exception as direct_err:
+                      print(f"⚡ Direct probe blocked ({direct_err}); connecting WARP to re-probe payload metadata...")
                       use_proxy = "true"
-                      is_archive = is_archive_name(payload_name)
+                      import subprocess
+                      subprocess.run(
+                          """
+                          if ! pgrep -x "warp-svc" >/dev/null 2>&1; then
+                            sudo mkdir -p /var/lib/cloudflare-warp /run/cloudflare-warp
+                            sudo systemctl start warp-svc || (sudo nohup warp-svc >/dev/null 2>&1 &)
+                          fi
+                          for i in {1..30}; do warp-cli --accept-tos status >/dev/null 2>&1 && break; sleep 0.5; done
+                          warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+                          warp-cli --accept-tos mode proxy
+                          warp-cli --accept-tos connect
+                          for i in {1..20}; do
+                            curl -s -x http://127.0.0.1:40000 --max-time 3 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on" && break
+                            sleep 1
+                          done
+                          """,
+                          shell=True,
+                          check=False
+                      )
+                      warp_proxies = {"http": "http://127.0.0.1:40000", "https": "http://127.0.0.1:40000"}
+                      probe_http(proxies=warp_proxies)
           except Exception as e:
               print(f"⚠️ Pre-flight metadata probe warning ({e}); defaulting to safe storage cleanup.")
 
@@ -414,6 +437,10 @@ jobs:
 
           # Helper function: Lazily connect Cloudflare WARP only when needed (torrents or blocked direct hosts)
           ensure_warp_connected() {
+            if curl -s -x http://127.0.0.1:40000 --max-time 2 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+              echo "✅ WARP proxy already active on 127.0.0.1:40000"
+              return 0
+            fi
             echo "🌐 Connecting Cloudflare WARP SOCKS5 proxy..."
             if ! pgrep -x "warp-svc" >/dev/null 2>&1; then
               sudo mkdir -p /var/lib/cloudflare-warp /run/cloudflare-warp
@@ -727,48 +754,34 @@ jobs:
             warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
 
           # -------------------------------------------------------------------------
-          # PATH 2: DIRECT HTTP/HTTPS LINKS (Direct-First 16-Stream aria2c + WARP Fallback)
+          # PATH 2: DIRECT HTTP/HTTPS LINKS (16-Stream aria2c + WARP HTTP Proxy Fallback)
           # -------------------------------------------------------------------------
           elif [[ "$PAYLOAD_TYPE" == "direct" ]]; then
-            PROXY_ARGS=()
+            UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/539.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/539.36"
+            ARIA_COMMON=(
+              -x 16 -s 16 -k 8M
+              --file-allocation=falloc
+              --disk-cache=128M
+              --stream-piece-selector=geom
+              --continue=true
+              --max-tries=5
+              --retry-wait=2
+              --console-log-level=warn
+              --summary-interval=5
+              --user-agent="$UA"
+              -d workspace -o "$SERVER_FILENAME" "$TARGET_LINK"
+            )
+
             if [[ "$USE_PROXY" == "true" ]]; then
               ensure_warp_connected
-              PROXY_ARGS=(--all-proxy="socks5://127.0.0.1:40000")
-              HEADERS=$(curl -g -sIL -x socks5h://127.0.0.1:40000 -H 'User-Agent: Mozilla/5.0' "$TARGET_LINK" || true)
-              SERVER_FILENAME=$(python3 -c "import sys, re, urllib.parse; h=sys.stdin.read(); m=re.search(r'(?i)filename\*?=(?:\"?UTF-8\'\'\"?)?([^\r\n;]+)', h); print(urllib.parse.unquote(m.group(1).strip(' \"\'')) if m else 'Direct_Payload.mkv')" <<< "$HEADERS")
-            fi
-
-            if [[ "$TARGET_LINK" == *.m3u8* ]] || [[ "$TARGET_LINK" == *.mpd* ]]; then
-              echo "🚀 Downloading HLS/DASH stream via yt-dlp + aria2c..."
-              yt-dlp "${PROXY_ARGS[@]/--all-proxy=/--proxy }" \
-                --add-header 'User-Agent: Mozilla/5.0' \
-                -N 16 --concurrent-fragments 16 \
-                --external-downloader aria2c \
-                --external-downloader-args "aria2c:-x 16 -s 16 -k 1M --file-allocation=falloc --disk-cache=128M" \
-                -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+              echo "🚀 Downloading direct link ('$SERVER_FILENAME') via 16-stream aria2c over WARP..."
+              aria2c --all-proxy="http://127.0.0.1:40000" "${ARIA_COMMON[@]}"
             else
-              echo "🚀 Downloading direct link ('$SERVER_FILENAME') via 16-stream aria2c..."
-              if ! aria2c "${PROXY_ARGS[@]}" \
-                -x 16 -s 16 -k 8M \
-                --file-allocation=falloc \
-                --disk-cache=128M \
-                --stream-piece-selector=geom \
-                --continue=true \
-                --max-tries=5 \
-                --retry-wait=2 \
-                --console-log-level=warn \
-                --summary-interval=5 \
-                --user-agent="Mozilla/5.0" \
-                -d workspace -o "$SERVER_FILENAME" "$TARGET_LINK"; then
-
-                echo "⚠️ Direct aria2c attempt failed; switching to WARP proxy + yt-dlp fallback..."
+              echo "🚀 Downloading direct link ('$SERVER_FILENAME') via 16-stream aria2c (direct)..."
+              if ! aria2c "${ARIA_COMMON[@]}"; then
+                echo "⚠️ Direct aria2c attempt failed; switching to WARP proxy + 16-stream aria2c..."
                 ensure_warp_connected
-                yt-dlp --proxy "socks5://127.0.0.1:40000" \
-                  --add-header 'User-Agent: Mozilla/5.0' \
-                  -N 16 \
-                  --external-downloader aria2c \
-                  --external-downloader-args "aria2c:-x 16 -s 16 -k 8M --file-allocation=falloc --disk-cache=128M" \
-                  -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+                aria2c --all-proxy="http://127.0.0.1:40000" "${ARIA_COMMON[@]}"
               fi
             fi
 
