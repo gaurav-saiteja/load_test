@@ -1113,17 +1113,49 @@ jobs:
           free_initial_gib = shutil.disk_usage(WORKSPACE_DIR).free / GB
           print(f"🎬 Discovered {len(target_files)} media file(s) ({total_Initial_gib:.2f} GiB total) | Free Disk: {free_initial_gib:.2f} GiB")
 
-          # Language and codec match tables
+          # Catch-all language tags (ISO 639-1/2, BCP-47, regional, scene, and Blu-ray remux tags)
+          # grouped by canonical language so each language in a multi-audio file is audited independently.
+          compatibility_audio_track_must_exist_for_these_languages = {
+              "english": {
+                  "en", "eng", "english", "en-us", "en-gb", "en-au", "en-ca",
+                  "en-nz", "en-ie", "en-za", "en-in", "eng-us", "eng-gb",
+                  "us", "uk", "gb", "american", "british"
+              },
+              "spanish": {
+                  "es", "spa", "esp", "spanish", "espanol", "español",
+                  "castellano", "castilian", "lat", "latino", "latin",
+                  "es-es", "es-419", "es-mx", "es-ar", "es-co", "es-cl",
+                  "es-pe", "es-ve", "es-us", "es-la", "spa-es", "spa-419", "spa-la"
+              },
+              "french": {
+                  "fr", "fre", "fra", "french", "francais", "français",
+                  "vf", "vff", "vfq", "vfi", "vf2", "vof", "truefrench",
+                  "fr-fr", "fr-ca", "fr-be", "fr-ch", "fre-fr", "fra-fr",
+                  "fre-ca", "fra-ca", "quebec", "québec"
+              },
+              "korean": {
+                  "ko", "kor", "korean", "hanguk", "hangul", "ko-kr", "kor-kr", "kr", "한국어"
+              },
+              "italian": {
+                  "it", "ita", "italian", "italiano", "it-it", "it-ch", "ita-it"
+              },
+              "japanese": {
+                  "ja", "jpn", "jap", "japanese", "nihongo", "ja-jp", "jpn-jp", "jp", "日本語"
+              },
+          }
+
           ALLOWED_AUDIO_LANGS = {
-              "en", "eng", "english",
               "hi", "hin", "hindi",
               "ta", "tam", "tamil",
               "te", "tel", "telugu",
               "ml", "mal", "malayalam",
-              "ko", "kor", "korean",
-              "ja", "jpn", "japanese",
-              "thai", "tha"
+              "th", "tha", "thai",
           }
+          for _lang_set in compatibility_audio_track_must_exist_for_these_languages.values():
+              ALLOWED_AUDIO_LANGS.update(_lang_set)
+
+          # Unlisted codecs (TrueHD, DTS/DTS-HD/DTS:X, FLAC, ALAC, Blu-ray LPCM/PCM) are treated as incompatible.
+          SAMSUNG_COMPATIBLE_CODECS = {"eac3", "ac3", "aac", "mp3", "opus", "ac4"}
           ALLOWED_SUB_LANGS = {"en", "eng", "english"}
           ALLOWED_TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text", "ttml"}
 
@@ -1158,6 +1190,34 @@ jobs:
               if title and COMMENTARY_RE.search(title):
                   return True
               return False
+
+          def get_compat_lang_group(lang_tokens: set):
+              for canon_lang, variations in compatibility_audio_track_must_exist_for_these_languages.items():
+                  if lang_tokens & variations:
+                      return canon_lang
+              return None
+
+          def rank_score(stream: dict) -> int:
+              codec = (stream.get("codec_name") or "").lower()
+              profile = (stream.get("profile") or "").lower()
+              channels = int(stream.get("channels") or 2)
+              tags = get_tags(stream)
+              # Fallback to MKV BPS tags when stream-level bit_rate metadata is absent on lossless tracks
+              bit_rate_raw = stream.get("bit_rate") or tags.get("bps") or tags.get("bps-eng") or 0
+              try:
+                  bit_rate = int(bit_rate_raw)
+              except ValueError:
+                  bit_rate = 0
+
+              score = 0
+              if "truehd" in codec or "dts-hd" in codec or "dts-hd" in profile or "ma" in profile:
+                  score += 100000000
+              elif "dts" in codec or "dca" in codec or "pcm" in codec or "flac" in codec:
+                  score += 50000000
+
+              score += channels * 1000000
+              score += bit_rate
+              return score
 
           # 2. Parallel ffprobe across all discovered episodes/files
           def probe_file(fpath: str):
@@ -1256,6 +1316,52 @@ jobs:
                   else:
                       other_drop.append((s, f"stream type '{ctype}' ({cname})"))
 
+                  # Group kept (non-commentary, language-tagged) audio tracks by target compatibility language
+              compat_transcode_plan = []  # List of dicts describing compatibility tracks to synthesize
+              lang_buckets = {}
+              for s in audio_keep:
+                  t_tags = get_tags(s)
+                  l_tokens = normalize_lang_tokens(t_tags.get("language", ""))
+                  canon_lang = get_compat_lang_group(l_tokens)
+                  if canon_lang:
+                      lang_buckets.setdefault(canon_lang, []).append(s)
+
+              for canon_lang, lang_streams in lang_buckets.items():
+                  has_compatible = any(
+                      (s.get("codec_name") or "").lower() in SAMSUNG_COMPATIBLE_CODECS
+                      for s in lang_streams
+                  )
+                  if not has_compatible:
+                      best_src = max(lang_streams, key=rank_score)
+                      src_idx = best_src["index"]
+                      src_codec = (best_src.get("codec_name") or "unknown").upper()
+                      src_ch = int(best_src.get("channels") or 2)
+                      src_tags = get_tags(best_src)
+                      src_title = src_tags.get("title", "")
+                      src_lang = src_tags.get("language", canon_lang[:3])
+
+                      if src_ch >= 5:
+                          target_ac, target_br = 6, "640k"
+                      else:
+                          target_ac, target_br = 2, "256k"
+
+                      comp_title = f"comp{src_title}"
+                      compat_transcode_plan.append({
+                          "canon_lang": canon_lang,
+                          "src_index": src_idx,
+                          "src_codec": src_codec,
+                          "src_channels": src_ch,
+                          "target_ac": target_ac,
+                          "target_br": target_br,
+                          "lang_tag": src_lang,
+                          "comp_title": comp_title,
+                      })
+                      print(
+                          f"  🔄 COMPAT SYNTHESIS [{canon_lang.upper()}]: No Samsung-compatible track found -> "
+                          f"Transcoding stream #{src_idx} ({src_codec}, {src_ch}ch) to E-AC-3 {target_ac}ch @ {target_br} "
+                          f"(title='{comp_title}')"
+                      )
+
               if not video_keep and video_drop:
                   video_keep.append(video_drop.pop(0)[0])
 
@@ -1289,8 +1395,8 @@ jobs:
                   print(f"  🗑️ DROP SUB   #{s.get('index')}: codec={s.get('codec_name')} lang={t.get('language', 'und')} title={t.get('title', '-')} -> {reason}")
 
               total_dropped_items = len(video_drop) + len(audio_drop) + len(sub_drop) + len(other_drop) + len(chapters)
-              if total_dropped_items == 0:
-                  print("✨ File is already completely clean (no bloat tracks, chapters, or attachments). Skipping remux!")
+              if total_dropped_items == 0 and not compat_transcode_plan:
+                  print("✨ File is already completely clean and all target languages have compatible audio. Skipping remux!")
                   continue
 
               ext = os.path.splitext(target_file)[1].lower()
@@ -1304,18 +1410,47 @@ jobs:
                   "-map_chapters", "-1",
                   "-dn",
               ]
+
+              # 1. Map kept video streams
               for s in video_keep:
                   cmd += ["-map", f"0:{s['index']}"]
+
+              # 2. Map original kept audio streams (passthrough)
               for s in audio_keep:
                   cmd += ["-map", f"0:{s['index']}"]
+
+              # 3. Map compatibility audio streams right after original audio streams
+              for plan in compat_transcode_plan:
+                  cmd += ["-map", f"0:{plan['src_index']}"]
+
+              # 4. Map kept subtitle streams
               for s in sub_keep:
                   cmd += ["-map", f"0:{s['index']}"]
 
+              # Video & Subtitle codecs
+              cmd += ["-c:v", "copy"]
               if ext == ".mp4":
-                  cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"]
+                  cmd += ["-c:s", "mov_text"]
               else:
-                  cmd += ["-c", "copy"]
+                  cmd += ["-c:s", "copy"]
 
+              # Original audio streams: stream copy
+              for out_a_idx in range(len(audio_keep)):
+                  cmd += [f"-c:a:{out_a_idx}", "copy"]
+
+              # Appended compatibility audio streams: E-AC-3 encode + metadata + clear default flag
+              for offset, plan in enumerate(compat_transcode_plan):
+                  out_a_idx = len(audio_keep) + offset
+                  cmd += [
+                      f"-c:a:{out_a_idx}", "eac3",
+                      f"-ac:a:{out_a_idx}", str(plan["target_ac"]),
+                      f"-b:a:{out_a_idx}", plan["target_br"],
+                      f"-metadata:s:a:{out_a_idx}", f"language={plan['lang_tag']}",
+                      f"-metadata:s:a:{out_a_idx}", f"title={plan['comp_title']}",
+                      f"-disposition:a:{out_a_idx}", "0",
+                  ]
+
+              # Preserve default flag on primary kept track (or set on first kept track if none had default)
               if audio_keep and not any((s.get("disposition") or {}).get("default", 0) == 1 for s in audio_keep):
                   cmd += ["-disposition:a:0", "default"]
 
