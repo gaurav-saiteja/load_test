@@ -1142,6 +1142,9 @@ jobs:
               "japanese": {
                   "ja", "jpn", "jap", "japanese", "nihongo", "ja-jp", "jpn-jp", "jp", "日本語"
               },
+              "german": {
+                  "de", "ger", "deu", "german", "deutsch", "de-de", "de-at", "de-ch", "ger-de", "deu-de"
+              },
           }
 
           ALLOWED_AUDIO_LANGS = {
