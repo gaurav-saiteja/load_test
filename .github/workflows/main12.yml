@@ -386,9 +386,9 @@ jobs:
           except Exception as e:
               print(f"⚠️ Pre-flight metadata probe warning ({e}); defaulting to safe storage cleanup.")
 
-          # Decision gate:
-          # - Archive (.zip/.rar/.7z/.tar) >= 40 GiB -> Free Space
-          # - Non-Archive >= 80 GiB -> Free Space
+          # Decision gate (tuned for MPEG-TS ~4.5% packet overhead on 85 GiB uncleaned runners):
+          # - Archive (.zip/.rar/.7z/.tar) >= 50 GiB -> Free Space
+          # - Non-Archive >= 65 GiB -> Free Space
           # - Unknown size (< 0) -> Free Space (safe fallback)
           if total_bytes < 0:
               need_free_space = "true"
@@ -396,7 +396,7 @@ jobs:
           else:
               size_gib = total_bytes / GIB
               size_str = f"{size_gib:.2f} GiB"
-              threshold_gib = 60.0 if is_archive else 80.0
+              threshold_gib = 50.0 if is_archive else 65.0
               need_free_space = "true" if size_gib >= threshold_gib else "false"
 
           print(
@@ -1292,8 +1292,12 @@ jobs:
               if not has_hdr10plus and re.search(r"(?i)\bhdr10(?:\+|plus)\b", orig_name):
                   has_hdr10plus = True
 
-              if has_dovi:
-                  return "DV+HDR10" if transfer == "smpte2084" else "DV"
+              # Reject pure Dolby Vision Profile 5 (proprietary IPT-PQ-c2 with no HDR10/PQ fallback)
+              if has_dovi and transfer != "smpte2084" and not has_hdr10plus:
+                  print(f"❌ Pure Dolby Vision (Profile 5) without an HDR10/SMPTE2084 base layer detected in '{orig_name}'. Aborting.")
+                  sys.exit(1)
+
+              # Since DV RPU/FEL NAL units (62-63) are stripped during Annex-B remuxing, classify by the true HDR base layer
               if has_hdr10plus:
                   return "HDR10+"
               if transfer == "smpte2084" or (primaries == "bt2020" and "10" in (vstream.get("pix_fmt") or "")):
@@ -1387,6 +1391,70 @@ jobs:
                       f.seek(max(0, fsize - sample_sz))
                       h.update(f.read(sample_sz))
               return h.hexdigest()[:10]
+
+          def parse_single_file_m3u8(m3u8_path: str, base_offset: int = 0) -> dict:
+              target_dur = 10
+              segments = []
+              cur_dur = None
+              expected_off = None
+              first_off = base_offset
+
+              with open(m3u8_path, "r", encoding="utf-8") as f:
+                  for raw_line in f:
+                      line = raw_line.strip()
+                      if line.startswith("#EXT-X-TARGETDURATION:"):
+                          try:
+                              target_dur = int(float(line.split(":", 1)[1]))
+                          except ValueError:
+                              pass
+                      elif line.startswith("#EXTINF:"):
+                          val = line.split(":", 1)[1].split(",")[0]
+                          cur_dur = round(float(val), 4)
+                      elif line.startswith("#EXT-X-BYTERANGE:") and cur_dur is not None:
+                          br = line.split(":", 1)[1]
+                          if "@" in br:
+                              length_s, off_s = br.split("@", 1)
+                              length = int(length_s)
+                              abs_off = base_offset + int(off_s)
+                          else:
+                              length = int(br)
+                              abs_off = expected_off if expected_off is not None else base_offset
+
+                          if expected_off is None:
+                              first_off = abs_off
+                              segments.append([cur_dur, length])
+                          elif abs_off == expected_off:
+                              segments.append([cur_dur, length])
+                          else:
+                              segments.append([cur_dur, length, abs_off])
+
+                          expected_off = abs_off + length
+                          cur_dur = None
+
+              return {
+                  "target_dur": target_dur,
+                  "start_offset": first_off,
+                  "segments": segments
+              }
+
+          def append_file_zero_copy(dst_path: str, src_path: str) -> int:
+              base_offset = os.path.getsize(dst_path)
+              remaining = os.path.getsize(src_path)
+              chunk_sz = 64 * MB
+              with open(dst_path, "ab") as dst_f, open(src_path, "rb") as src_f:
+                  dst_fd = dst_f.fileno()
+                  src_fd = src_f.fileno()
+                  while remaining > 0:
+                      to_copy = min(chunk_sz, remaining)
+                      try:
+                          copied = os.copy_file_range(src_fd, None, dst_fd, None, to_copy)
+                          if copied == 0:
+                              break
+                          remaining -= copied
+                      except OSError:
+                          shutil.copyfileobj(src_f, dst_f, length=16 * MB)
+                          break
+              return base_offset
 
           # 2. Parallel ffprobe across all discovered episodes/files (with -show_format)
           def probe_file(fpath: str):
@@ -1578,49 +1646,114 @@ jobs:
               os.makedirs(sub_dir, exist_ok=True)
               extracted_subs_meta = []
 
-              # Always output fast-start .mkv with Cues at the front of the file (-reserve_index_space 512k) and -sn
+              # Output single-file keyframe-aligned MPEG-TS (.ts) + byte-range .m3u8
               stem_clean = os.path.splitext(orig_filename)[0]
-              final_mkv_path = os.path.join(os.path.dirname(target_file), f"{stem_clean}.mkv")
-              temp_output = os.path.join(os.path.dirname(target_file), f".lean_remux_tmp_{idx}.mkv")
+              parent_dir = os.path.dirname(target_file)
+              final_ts_path = os.path.join(parent_dir, f"{stem_clean}.ts")
+              temp_output = os.path.join(parent_dir, f".lean_remux_tmp_{idx}.ts")
+              temp_video_m3u8 = os.path.join(parent_dir, f".lean_video_{idx}.m3u8")
+              is_multi_audio = len(final_audio_plan) > 1
+
+              if raw_vcodec in {"hevc", "h265"}:
+                  vbsf_args = ["-bsf:v", "hevc_mp4toannexb,filter_units=remove_types=62-63"]
+              elif raw_vcodec in {"h264", "avc"}:
+                  vbsf_args = ["-bsf:v", "h264_mp4toannexb"]
+              else:
+                  vbsf_args = []
+
+              hls_common_flags = [
+                  "-mpegts_flags", "+system_b",
+                  "-avoid_negative_ts", "make_zero",
+                  "-muxdelay", "0",
+                  "-muxpreload", "0",
+                  "-max_muxing_queue_size", "9999",
+                  "-f", "hls",
+                  "-hls_time", "10",
+                  "-hls_playlist_type", "vod",
+                  "-hls_segment_type", "mpegts",
+                  "-hls_flags", "single_file+independent_segments",
+              ]
 
               cmd = [
                   "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                  "-copyts", "-start_at_zero",
                   "-i", target_file,
-                  "-map_chapters", "-1",
-                  "-dn",
-                  "-sn",
-                  "-map", f"0:{v0['index']}",
               ]
 
-              for plan in final_audio_plan:
-                  cmd += ["-map", f"0:{plan['src_index']}"]
+              temp_audio_outputs = []
 
-              cmd += ["-c:v", "copy"]
-
-              for out_a_idx, plan in enumerate(final_audio_plan):
-                  disp_flag = "default" if out_a_idx == 0 else "0"
+              if not is_multi_audio:
+                  # Single Audio Track: Mux Video + Audio 0 into one interleaved .ts byte-range stream
+                  plan = final_audio_plan[0]
+                  cmd += [
+                      "-map_chapters", "-1", "-dn", "-sn",
+                      "-map", f"0:{v0['index']}",
+                      "-map", f"0:{plan['src_index']}",
+                      "-c:v", "copy",
+                      *vbsf_args,
+                  ]
                   if plan["mode"] == "copy":
                       cmd += [
-                          f"-c:a:{out_a_idx}", "copy",
-                          f"-metadata:s:a:{out_a_idx}", f"language={plan['iso_lang']}",
-                          f"-metadata:s:a:{out_a_idx}", f"title={plan['title']}",
-                          f"-disposition:a:{out_a_idx}", disp_flag,
+                          "-c:a:0", "copy",
+                          "-metadata:s:a:0", f"language={plan['iso_lang']}",
+                          "-metadata:s:a:0", f"title={plan['title']}",
+                          "-disposition:a:0", "default",
                       ]
                   else:
                       cmd += [
-                          f"-c:a:{out_a_idx}", "eac3",
-                          f"-ac:a:{out_a_idx}", str(plan["target_ac"]),
-                          f"-b:a:{out_a_idx}", plan["target_br"],
-                          f"-metadata:s:a:{out_a_idx}", f"language={plan['iso_lang']}",
-                          f"-metadata:s:a:{out_a_idx}", f"title={plan['title']}",
-                          f"-disposition:a:{out_a_idx}", disp_flag,
+                          "-c:a:0", "eac3",
+                          "-ac:a:0", str(plan["target_ac"]),
+                          "-b:a:0", plan["target_br"],
+                          "-metadata:s:a:0", f"language={plan['iso_lang']}",
+                          "-metadata:s:a:0", f"title={plan['title']}",
+                          "-disposition:a:0", "default",
                       ]
+                  cmd += [
+                      "-fps_mode", "passthrough",
+                      *hls_common_flags,
+                      "-hls_segment_filename", temp_output,
+                      temp_video_m3u8,
+                  ]
+              else:
+                  # Multi-Audio Tracks: Output pure Video .ts + discrete per-language Audio .ts streams in one pass
+                  cmd += [
+                      "-map_chapters", "-1", "-dn", "-sn", "-an",
+                      "-map", f"0:{v0['index']}",
+                      "-c:v", "copy",
+                      *vbsf_args,
+                      "-fps_mode", "passthrough",
+                      *hls_common_flags,
+                      "-hls_segment_filename", temp_output,
+                      temp_video_m3u8,
+                  ]
+                  for out_a_idx, plan in enumerate(final_audio_plan):
+                      a_ts_tmp = os.path.join(parent_dir, f".lean_audio_{idx}_{out_a_idx}.ts")
+                      a_m3u8_tmp = os.path.join(parent_dir, f".lean_audio_{idx}_{out_a_idx}.m3u8")
+                      temp_audio_outputs.append((out_a_idx, plan, a_ts_tmp, a_m3u8_tmp))
 
-              cmd += [
-                  "-reserve_index_space", "512k",
-                  "-max_muxing_queue_size", "9999",
-                  temp_output
-              ]
+                      cmd += [
+                          "-map_chapters", "-1", "-dn", "-sn", "-vn",
+                          "-map", f"0:{plan['src_index']}",
+                      ]
+                      if plan["mode"] == "copy":
+                          cmd += [
+                              "-c:a:0", "copy",
+                              "-metadata:s:a:0", f"language={plan['iso_lang']}",
+                              "-metadata:s:a:0", f"title={plan['title']}",
+                          ]
+                      else:
+                          cmd += [
+                              "-c:a:0", "eac3",
+                              "-ac:a:0", str(plan["target_ac"]),
+                              "-b:a:0", plan["target_br"],
+                              "-metadata:s:a:0", f"language={plan['iso_lang']}",
+                              "-metadata:s:a:0", f"title={plan['title']}",
+                          ]
+                      cmd += [
+                          *hls_common_flags,
+                          "-hls_segment_filename", a_ts_tmp,
+                          a_m3u8_tmp,
+                      ]
 
               # Single-pass subtitle extraction & conversion to UTF-8 .srt in the exact same ffmpeg command
               for sub_out_idx, s in enumerate(sub_keep):
@@ -1715,15 +1848,57 @@ jobs:
                   print(f"❌ ffmpeg remux failed (exit {proc.returncode}):\n{stderr_out}")
                   sys.exit(1)
 
-              # Remove original input file (if extension was .mp4/.m2ts) and move temp_output to final_mkv_path
-              if os.path.exists(target_file) and os.path.realpath(target_file) != os.path.realpath(final_mkv_path):
+              # 1. Immediately unlink original input file to free disk space before concatenating audio tracks
+              if os.path.exists(target_file) and os.path.realpath(target_file) != os.path.realpath(final_ts_path):
                   try:
                       os.remove(target_file)
                   except OSError:
                       pass
-              os.replace(temp_output, final_mkv_path)
+              os.replace(temp_output, final_ts_path)
 
-              # Sanitize ASS positioning/override tags from extracted UTF-8 .srt files
+              # 2. Parse primary video .m3u8 byte-range index and record video section size
+              video_section_bytes = os.path.getsize(final_ts_path)
+              video_hls_index = parse_single_file_m3u8(temp_video_m3u8, base_offset=0)
+              try:
+                  os.remove(temp_video_m3u8)
+              except OSError:
+                  pass
+
+              # 3. If multi-audio, zero-copy append each audio .ts onto the tail of final_ts_path & shift byte offsets
+              audio_hls_tracks = []
+              if is_multi_audio:
+                  for out_a_idx, plan, a_ts_tmp, a_m3u8_tmp in temp_audio_outputs:
+                      if not os.path.exists(a_ts_tmp) or not os.path.exists(a_m3u8_tmp):
+                          print(f"❌ Missing expected audio HLS output for track #{out_a_idx}")
+                          sys.exit(1)
+                      base_off = append_file_zero_copy(final_ts_path, a_ts_tmp)
+                      a_parsed = parse_single_file_m3u8(a_m3u8_tmp, base_offset=base_off)
+                      try:
+                          os.remove(a_ts_tmp)
+                          os.remove(a_m3u8_tmp)
+                      except OSError:
+                          pass
+                      audio_hls_tracks.append({
+                          "index": out_a_idx,
+                          "lang": plan["iso_lang"],
+                          "name": plan["title"],
+                          "codec": plan["out_codec_label"],
+                          "channels": plan["out_channels_label"],
+                          "default": out_a_idx == 0,
+                          "target_dur": a_parsed["target_dur"],
+                          "start_offset": a_parsed["start_offset"],
+                          "segments": a_parsed["segments"],
+                      })
+
+              hls_manifest_obj = {
+                  "v": 1,
+                  "mode": "discrete" if is_multi_audio else "muxed",
+                  "video": video_hls_index,
+                  "audio": audio_hls_tracks,
+              }
+              hls_manifest_json = json.dumps(hls_manifest_obj, separators=(",", ":"))
+
+              # 4. Sanitize ASS positioning/override tags from extracted UTF-8 .srt files
               valid_subs = []
               for sm in extracted_subs_meta:
                   spath = sm["local_path"]
@@ -1738,13 +1913,14 @@ jobs:
                       except Exception as e:
                           print(f"  ⚠️ Subtitle sanitization warning on {spath}: {e}")
 
-              new_size = os.path.getsize(final_mkv_path)
-              content_hash = compute_fast_content_hash(final_mkv_path)
+              new_size = os.path.getsize(final_ts_path)
+              content_hash = compute_fast_content_hash(final_ts_path)
 
-              # Calculate pure video bitrate in Mbps (subtracting approx audio overhead)
-              total_mbps = (new_size * 8.0) / (max(1, duration_sec) * 1_000_000.0)
-              audio_mbps_est = len(final_audio_plan) * 0.64
-              video_bitrate_mbps = round(max(0.5, total_mbps - audio_mbps_est), 2)
+              # 5. Calculate pure elementary video bitrate in Mbps (compensating for ~4.5% MPEG-TS 188-byte packet overhead)
+              effective_video_bytes = video_section_bytes * 0.955
+              video_section_mbps = (effective_video_bytes * 8.0) / (max(1, duration_sec) * 1_000_000.0)
+              audio_in_video_mbps = 0.0 if is_multi_audio else 0.64
+              video_bitrate_mbps = round(max(0.5, video_section_mbps - audio_in_video_mbps), 2)
 
               media_type, s_num, e_num, quality_source, edition, release_group = parse_release_metadata(
                   orig_filename, res_label, video_bitrate_mbps, has_x26x_sei
@@ -1754,17 +1930,17 @@ jobs:
               audio_langs_list = list(dict.fromkeys(p["display_lang"] for p in final_audio_plan))
               audio_summary = f"{primary_audio['out_codec_label']} {primary_audio['out_channels_label']} ({', '.join(audio_langs_list)})"
 
-              saved_gib = (orig_size - new_size) / GB
               speed_mibs = (new_size / MB) / elapsed
               print(
-                  f"✅ Remux complete in {elapsed:.1f}s ({speed_mibs:.1f} MiB/s) | "
+                  f"✅ HLS .ts Remux complete in {elapsed:.1f}s ({speed_mibs:.1f} MiB/s) | "
                   f"Size: {orig_size / GB:.2f} GiB -> {new_size / GB:.2f} GiB | "
+                  f"Mode: {hls_manifest_obj['mode'].upper()} ({len(video_hls_index['segments'])} segs, {len(hls_manifest_json) / 1024:.1f} KB index) | "
                   f"Verified: {res_label} {quality_source} {hdr_format} ({video_bitrate_mbps} Mbps) | "
                   f"Extracted {len(valid_subs)} .srt track(s) | Hash: {content_hash}"
               )
 
               ingest_manifest.append({
-                  "local_video_path": final_mkv_path,
+                  "local_video_path": final_ts_path,
                   "sub_dir": sub_dir,
                   "content_hash": content_hash,
                   "imdb_id": IMDB_ID,
@@ -1788,10 +1964,11 @@ jobs:
                   "audio_summary": audio_summary,
                   "file_size_bytes": new_size,
                   "duration_sec": duration_sec,
-                  "filename": f"{stem_clean}.mkv",
+                  "filename": f"{stem_clean}.ts",
+                  "hls_manifest_json": hls_manifest_json,
                   "subtitles": valid_subs,
               })
-
+              
           with open(os.path.join(WORKSPACE_DIR, "ingest_manifest.json"), "w", encoding="utf-8") as mf:
               json.dump(ingest_manifest, mf, indent=2)
           EOF_BLOAT
@@ -1866,7 +2043,7 @@ jobs:
               else:
                   base_remote_dir = f"movies/{imdb_id}/{version_folder}"
 
-              remote_video_path = f"{base_remote_dir}/video.mkv"
+              remote_video_path = f"{base_remote_dir}/video.ts"
               batch_add_list = [(local_video, remote_video_path)]
 
               subtitles_payload = []
@@ -1949,6 +2126,7 @@ jobs:
                   "filename": item["filename"],
                   "hf_bucket": HF_BUCKET,
                   "hf_video_path": remote_video_path,
+                  "hls_manifest_json": item["hls_manifest_json"],
                   "subtitles": subtitles_payload,
               }
 
